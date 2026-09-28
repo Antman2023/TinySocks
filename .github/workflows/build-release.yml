@@ -1,0 +1,57 @@
+name: Build and release
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build Linux, Windows, and macOS binaries
+        run: |
+          mkdir dist
+          zig cc -target x86_64-linux-musl -std=c11 -O2 -Wall -Wextra tinysocks.c -o dist/tinysocks-linux-x86_64 -pthread -static
+          zig cc -target aarch64-linux-musl -std=c11 -O2 -Wall -Wextra tinysocks.c -o dist/tinysocks-linux-arm64 -pthread -static
+          zig cc -target arm-linux-musleabihf -std=c11 -O2 -Wall -Wextra tinysocks.c -o dist/tinysocks-linux-armv7 -pthread -static
+          make mipsel mips
+          cp tinysocks-mipsel dist/tinysocks-linux-mipsel
+          cp tinysocks-mips dist/tinysocks-linux-mips
+          zig cc -target x86_64-windows-gnu -std=c11 -O2 -Wall -Wextra tinysocks.c -o dist/tinysocks-windows-x86_64.exe -lws2_32
+          zig cc -target aarch64-windows-gnu -std=c11 -O2 -Wall -Wextra tinysocks.c -o dist/tinysocks-windows-arm64.exe -lws2_32
+          zig cc -target x86_64-macos -std=c11 -O2 -Wall -Wextra tinysocks.c -o dist/tinysocks-macos-x86_64 -pthread
+          zig cc -target aarch64-macos -std=c11 -O2 -Wall -Wextra tinysocks.c -o dist/tinysocks-macos-arm64 -pthread
+          (cd dist && sha256sum tinysocks-* > SHA256SUMS)
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tinysocks-binaries
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: tinysocks-binaries
+          path: dist
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes

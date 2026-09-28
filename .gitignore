@@ -1,0 +1,7 @@
+.zig-cache-global/
+.zig-cache-local/
+dist/
+tinysocks.exe
+tinysocks.pdb
+tinysocks-mips
+tinysocks-mipsel
