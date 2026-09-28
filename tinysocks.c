@@ -29,6 +29,7 @@ typedef int socket_t;
 
 #define HANDSHAKE_TIMEOUT_SECONDS 15
 #define CONNECT_TIMEOUT_SECONDS 10
+#define UDP_BUFFER_SIZE 65536
 
 static int socket_error(void) {
 #ifdef _WIN32
@@ -235,6 +236,212 @@ static void relay(socket_t client, socket_t target) {
     }
 }
 
+static void normalize_ipv4_mapped(struct sockaddr_storage *address) {
+    static const unsigned char prefix[12] =
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255};
+    if (address->ss_family == AF_INET6) {
+        const struct sockaddr_in6 *ipv6 = (const struct sockaddr_in6 *)address;
+        if (memcmp(&ipv6->sin6_addr, prefix, sizeof(prefix)) == 0) {
+            struct sockaddr_in ipv4;
+            memset(&ipv4, 0, sizeof(ipv4));
+            ipv4.sin_family = AF_INET;
+            ipv4.sin_port = ipv6->sin6_port;
+            memcpy(&ipv4.sin_addr, (const unsigned char *)&ipv6->sin6_addr + 12, 4);
+            memset(address, 0, sizeof(*address));
+            memcpy(address, &ipv4, sizeof(ipv4));
+        }
+    }
+}
+
+static socklen_t address_length(const struct sockaddr_storage *address) {
+    return (socklen_t)(address->ss_family == AF_INET ? sizeof(struct sockaddr_in) :
+                       sizeof(struct sockaddr_in6));
+}
+
+static int same_ip(const struct sockaddr_storage *a,
+                   const struct sockaddr_storage *b) {
+    if (a->ss_family != b->ss_family) return 0;
+    if (a->ss_family == AF_INET) {
+        return ((const struct sockaddr_in *)a)->sin_addr.s_addr ==
+               ((const struct sockaddr_in *)b)->sin_addr.s_addr;
+    }
+    if (a->ss_family == AF_INET6) {
+        const struct sockaddr_in6 *x = (const struct sockaddr_in6 *)a;
+        const struct sockaddr_in6 *y = (const struct sockaddr_in6 *)b;
+        return memcmp(&x->sin6_addr, &y->sin6_addr, 16) == 0 &&
+               x->sin6_scope_id == y->sin6_scope_id;
+    }
+    return 0;
+}
+
+static unsigned short address_port(const struct sockaddr_storage *address) {
+    if (address->ss_family == AF_INET)
+        return ntohs(((const struct sockaddr_in *)address)->sin_port);
+    return ntohs(((const struct sockaddr_in6 *)address)->sin6_port);
+}
+
+static void set_address_port(struct sockaddr_storage *address, unsigned short port) {
+    if (address->ss_family == AF_INET)
+        ((struct sockaddr_in *)address)->sin_port = htons(port);
+    else
+        ((struct sockaddr_in6 *)address)->sin6_port = htons(port);
+}
+
+static void forward_udp_request(const unsigned char *packet, size_t length,
+                                socket_t *ipv4, socket_t *ipv6) {
+    char host[256], port[6];
+    size_t offset = 4, address_size;
+    int family;
+    if (length < 4 || packet[0] != 0 || packet[1] != 0 || packet[2] != 0)
+        return; /* Fragmented UDP datagrams are not supported. */
+    if (packet[3] == 1 || packet[3] == 4) {
+        family = packet[3] == 1 ? AF_INET : AF_INET6;
+        address_size = family == AF_INET ? 4 : 16;
+        if (length < offset + address_size + 2 ||
+            !inet_ntop(family, packet + offset, host, sizeof(host))) return;
+        offset += address_size;
+    } else if (packet[3] == 3) {
+        if (length < offset + 1 || packet[offset] == 0) return;
+        address_size = packet[offset++];
+        if (length < offset + address_size + 2 ||
+            memchr(packet + offset, '\0', address_size) != NULL) return;
+        memcpy(host, packet + offset, address_size);
+        host[address_size] = '\0';
+        offset += address_size;
+        family = AF_UNSPEC;
+    } else {
+        return;
+    }
+    snprintf(port, sizeof(port), "%u", (unsigned)(packet[offset] << 8 | packet[offset + 1]));
+    offset += 2;
+
+    struct addrinfo hints, *addresses = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = family;
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_protocol = IPPROTO_UDP;
+    if (getaddrinfo(host, port, &hints, &addresses) != 0) return;
+    for (struct addrinfo *address = addresses; address; address = address->ai_next) {
+        socket_t *outbound = address->ai_family == AF_INET ? ipv4 : ipv6;
+        if (address->ai_family != AF_INET && address->ai_family != AF_INET6) continue;
+        if (*outbound == INVALID_FD)
+            *outbound = socket(address->ai_family, SOCK_DGRAM, IPPROTO_UDP);
+        if (*outbound != INVALID_FD &&
+            sendto(*outbound, (const char *)packet + offset, (int)(length - offset), 0,
+                   address->ai_addr, (socklen_t)address->ai_addrlen) >= 0) break;
+    }
+    freeaddrinfo(addresses);
+}
+
+static void forward_udp_reply(socket_t outbound, socket_t association,
+                              const struct sockaddr_storage *client_address,
+                              unsigned char *packet) {
+    struct sockaddr_storage source;
+    socklen_t source_length = (socklen_t)sizeof(source);
+    int count = recvfrom(outbound, (char *)packet + 22, UDP_BUFFER_SIZE - 22, 0,
+                         (struct sockaddr *)&source, &source_length);
+    if (count < 0) return;
+    normalize_ipv4_mapped(&source);
+    size_t header_length;
+    unsigned char *reply;
+    if (source.ss_family == AF_INET) {
+        const struct sockaddr_in *ipv4 = (const struct sockaddr_in *)&source;
+        header_length = 10;
+        reply = packet + 12;
+        reply[3] = 1;
+        memcpy(reply + 4, &ipv4->sin_addr, 4);
+        memcpy(reply + 8, &ipv4->sin_port, 2);
+    } else if (source.ss_family == AF_INET6) {
+        const struct sockaddr_in6 *ipv6 = (const struct sockaddr_in6 *)&source;
+        header_length = 22;
+        reply = packet;
+        reply[3] = 4;
+        memcpy(reply + 4, &ipv6->sin6_addr, 16);
+        memcpy(reply + 20, &ipv6->sin6_port, 2);
+    } else {
+        return;
+    }
+    reply[0] = 0;
+    reply[1] = 0;
+    reply[2] = 0;
+    (void)sendto(association, (const char *)reply, count + (int)header_length, 0,
+                 (const struct sockaddr *)client_address, address_length(client_address));
+}
+
+static void udp_associate(socket_t client, unsigned short requested_port) {
+    struct sockaddr_storage local, peer, udp_client;
+    socklen_t length = (socklen_t)sizeof(local);
+    socket_t association = INVALID_FD, ipv4 = INVALID_FD, ipv6 = INVALID_FD;
+    if (getsockname(client, (struct sockaddr *)&local, &length) != 0) goto failed;
+    length = (socklen_t)sizeof(peer);
+    if (getpeername(client, (struct sockaddr *)&peer, &length) != 0) goto failed;
+    normalize_ipv4_mapped(&local);
+    normalize_ipv4_mapped(&peer);
+    if (local.ss_family != AF_INET && local.ss_family != AF_INET6) goto failed;
+    set_address_port(&local, 0);
+    association = socket(local.ss_family, SOCK_DGRAM, IPPROTO_UDP);
+    if (association == INVALID_FD ||
+        bind(association, (struct sockaddr *)&local, address_length(&local)) != 0)
+        goto failed;
+    send_reply(client, 0, association);
+    set_handshake_timeout(client, 0);
+
+    unsigned char packet[UDP_BUFFER_SIZE];
+    int client_known = 0;
+    for (;;) {
+        fd_set readable;
+        FD_ZERO(&readable);
+        FD_SET(client, &readable);
+        FD_SET(association, &readable);
+        socket_t highest = client > association ? client : association;
+        if (ipv4 != INVALID_FD) {
+            FD_SET(ipv4, &readable);
+            if (ipv4 > highest) highest = ipv4;
+        }
+        if (ipv6 != INVALID_FD) {
+            FD_SET(ipv6, &readable);
+            if (ipv6 > highest) highest = ipv6;
+        }
+        int ready = select((int)highest + 1, &readable, NULL, NULL, NULL);
+        if (ready < 0) {
+            if (interrupted(socket_error())) continue;
+            break;
+        }
+        if (FD_ISSET(client, &readable)) {
+            /* The TCP control connection defines the association lifetime. */
+            int count = recv(client, (char *)packet, sizeof(packet), 0);
+            if (count <= 0 && !(count < 0 && interrupted(socket_error()))) break;
+        }
+        if (FD_ISSET(association, &readable)) {
+            struct sockaddr_storage source;
+            socklen_t source_length = (socklen_t)sizeof(source);
+            int count = recvfrom(association, (char *)packet, sizeof(packet), 0,
+                                 (struct sockaddr *)&source, &source_length);
+            if (count >= 0) {
+                normalize_ipv4_mapped(&source);
+                if (same_ip(&peer, &source) &&
+                    (!requested_port || address_port(&source) == requested_port) &&
+                    (!client_known || address_port(&source) == address_port(&udp_client))) {
+                    udp_client = source;
+                    client_known = 1;
+                    forward_udp_request(packet, (size_t)count, &ipv4, &ipv6);
+                }
+            }
+        }
+        if (client_known && ipv4 != INVALID_FD && FD_ISSET(ipv4, &readable))
+            forward_udp_reply(ipv4, association, &udp_client, packet);
+        if (client_known && ipv6 != INVALID_FD && FD_ISSET(ipv6, &readable))
+            forward_udp_reply(ipv6, association, &udp_client, packet);
+    }
+    goto done;
+failed:
+    send_reply(client, 1, INVALID_FD);
+done:
+    if (association != INVALID_FD) close_socket(association);
+    if (ipv4 != INVALID_FD) close_socket(ipv4);
+    if (ipv6 != INVALID_FD) close_socket(ipv6);
+}
+
 static void handle_client(socket_t client) {
     unsigned char header[4], methods[255], address[16], port_bytes[2];
     char host[256], port[6];
@@ -251,7 +458,7 @@ static void handle_client(socket_t client) {
     if (!send_all(client, selection, sizeof(selection)) || !no_auth) goto done;
 
     if (!recv_all(client, header, 4) || header[0] != 5 || header[2] != 0) goto done;
-    if (header[1] != 1) {
+    if (header[1] != 1 && header[1] != 3) {
         send_reply(client, 7, INVALID_FD); /* Command not supported. */
         goto done;
     }
@@ -272,6 +479,11 @@ static void handle_client(socket_t client) {
     }
     if (!recv_all(client, port_bytes, 2)) goto done;
     snprintf(port, sizeof(port), "%u", (unsigned)(port_bytes[0] << 8 | port_bytes[1]));
+
+    if (header[1] == 3) {
+        udp_associate(client, (unsigned short)(port_bytes[0] << 8 | port_bytes[1]));
+        goto done;
+    }
 
     unsigned char status;
     target = connect_target(host, port, &status);

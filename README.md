@@ -1,6 +1,6 @@
 # TinySocks
 
-一个单文件 C 实现的 SOCKS5 TCP 代理，使用 `zig cc` 编译。支持无认证的 `CONNECT` 命令，以及 IPv4、IPv6 和域名目标。
+一个单文件 C 实现的 SOCKS5 代理，使用 `zig cc` 编译。支持无认证的 TCP `CONNECT` 和 `UDP ASSOCIATE` 命令，以及 IPv4、IPv6 和域名目标。
 
 ## 自动编译与发布
 
@@ -68,4 +68,4 @@ tinysocks [监听地址 [端口]]
 
 默认监听 `0.0.0.0:1080`。例如，仅允许本机连接时运行 `tinysocks 127.0.0.1 1080`。
 
-可用 `curl --socks5-hostname 127.0.0.1:1080 http://example.com/` 测试。代理不提供身份认证；监听公网地址时，请自行限制访问来源。
+可用 `curl --socks5-hostname 127.0.0.1:1080 http://example.com/` 测试 TCP 转发。UDP 客户端通过 TCP 建立 `UDP ASSOCIATE` 后，向回复中的地址和端口发送 SOCKS5 UDP 数据报；TCP 连接关闭时 UDP 会话随之结束。仅接受来自该 TCP 客户端地址及指定 UDP 端口的数据报；请求端口为 0 时使用首个数据报的来源端口。UDP 分片（`FRAG` 非 0）不受支持。代理不提供身份认证；监听公网地址时，请自行限制访问来源。
