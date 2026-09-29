@@ -19,6 +19,11 @@ jobs:
         with:
           version: 0.16.0
 
+      - name: Test SOCKS5 behavior
+        run: |
+          zig cc -std=c11 -O2 -Wall -Wextra -DMAX_CLIENTS=2 -DIDLE_TIMEOUT_SECONDS=3 -DHANDSHAKE_TIMEOUT_SECONDS=1 tinysocks.c -o tinysocks-test -pthread
+          python3 tests/test_proxy.py ./tinysocks-test
+
       - name: Build Linux, Windows, and macOS binaries
         run: |
           mkdir dist

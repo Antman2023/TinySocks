@@ -1,7 +1,11 @@
 .zig-cache-global/
 .zig-cache-local/
+__pycache__/
 dist/
 tinysocks.exe
 tinysocks.pdb
+tinysocks-test
+tinysocks-test.exe
+tinysocks-test.pdb
 tinysocks-mips
 tinysocks-mipsel
