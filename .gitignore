@@ -2,6 +2,7 @@
 .zig-cache-local/
 __pycache__/
 dist/
+/tinysocks
 tinysocks.exe
 tinysocks.pdb
 tinysocks-test

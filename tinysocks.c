@@ -25,6 +25,7 @@ typedef int socket_t;
 #endif
 
 #include <stdio.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdatomic.h>
@@ -34,7 +35,9 @@ typedef int socket_t;
 #ifndef HANDSHAKE_TIMEOUT_SECONDS
 #define HANDSHAKE_TIMEOUT_SECONDS 15
 #endif
+#ifndef CONNECT_TIMEOUT_SECONDS
 #define CONNECT_TIMEOUT_SECONDS 10
+#endif
 #define UDP_BUFFER_SIZE 65536
 #define UDP_DESTINATION_LIMIT 64
 #define UDP_DESTINATION_TTL_SECONDS 60
@@ -45,6 +48,14 @@ typedef int socket_t;
 #ifndef IDLE_TIMEOUT_SECONDS
 #define IDLE_TIMEOUT_SECONDS 300
 #endif
+
+_Static_assert(MAX_CLIENTS > 0, "MAX_CLIENTS must be positive");
+_Static_assert(HANDSHAKE_TIMEOUT_SECONDS > 0 && HANDSHAKE_TIMEOUT_SECONDS <= INT_MAX / 1000,
+               "HANDSHAKE_TIMEOUT_SECONDS is out of range");
+_Static_assert(CONNECT_TIMEOUT_SECONDS > 0 && CONNECT_TIMEOUT_SECONDS <= INT_MAX / 1000,
+               "CONNECT_TIMEOUT_SECONDS is out of range");
+_Static_assert(IDLE_TIMEOUT_SECONDS > 0 && IDLE_TIMEOUT_SECONDS <= INT_MAX / 1000,
+               "IDLE_TIMEOUT_SECONDS is out of range");
 
 #ifdef _WIN32
 typedef WSAPOLLFD pollfd_t;
@@ -99,15 +110,45 @@ static int interrupted(int error) {
 #endif
 }
 
+static int would_block(int error) {
+#ifdef _WIN32
+    return error == WSAEWOULDBLOCK;
+#else
+    return error == EAGAIN || error == EWOULDBLOCK;
+#endif
+}
+
+static int remaining_milliseconds(uint64_t deadline_ms) {
+    uint64_t now = monotonic_milliseconds();
+    if (now >= deadline_ms) return 0;
+    uint64_t remaining = deadline_ms - now;
+    return remaining > INT_MAX ? INT_MAX : (int)remaining;
+}
+
 static int set_nonblocking(socket_t fd, int enabled) {
 #ifdef _WIN32
     u_long mode = enabled ? 1 : 0;
     return ioctlsocket(fd, FIONBIO, &mode) == 0;
 #else
-    /* Only used while establishing a new outbound connection. */
     int flags = fcntl(fd, F_GETFL, 0);
     return flags >= 0 && fcntl(fd, F_SETFL,
                                enabled ? flags | O_NONBLOCK : flags & ~O_NONBLOCK) == 0;
+#endif
+}
+
+static int wait_for_connect(socket_t fd, int timeout_ms) {
+#ifdef _WIN32
+    /* select reports failed connections in the exception set on older Winsock too. */
+    fd_set writable, failed;
+    FD_ZERO(&writable);
+    FD_ZERO(&failed);
+    FD_SET(fd, &writable);
+    FD_SET(fd, &failed);
+    struct timeval timeout = {timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+    return select(0, NULL, &writable, &failed, &timeout);
+#else
+    pollfd_t writable = {fd, POLLOUT, 0};
+    return poll_sockets(&writable, 1, timeout_ms);
 #endif
 }
 
@@ -182,21 +223,29 @@ static void send_reply(socket_t client, unsigned char status, socket_t outbound)
     (void)send_all(client, reply, length);
 }
 
-static socket_t connect_target(const char *host, const char *port, unsigned char *status) {
+static socket_t connect_target(const char *host, const char *port, int family,
+                               unsigned char *status) {
     struct addrinfo hints;
     struct addrinfo *addresses = NULL;
     socket_t result = INVALID_FD;
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
+    hints.ai_family = family;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
+    hints.ai_flags = AI_NUMERICSERV | (family == AF_UNSPEC ? 0 : AI_NUMERICHOST);
     if (getaddrinfo(host, port, &hints, &addresses) != 0) {
         *status = 4; /* Host unreachable. */
         return INVALID_FD;
     }
 
     *status = 1; /* General failure. */
+    /* Share one connection budget across all resolved addresses. */
+    uint64_t deadline_ms = monotonic_milliseconds() + CONNECT_TIMEOUT_SECONDS * 1000;
     for (struct addrinfo *address = addresses; address; address = address->ai_next) {
+        if (!remaining_milliseconds(deadline_ms)) {
+            *status = 4;
+            break;
+        }
         socket_t fd = socket(address->ai_family, address->ai_socktype, address->ai_protocol);
         if (fd == INVALID_FD) continue;
         if (!set_nonblocking(fd, 1)) {
@@ -213,8 +262,11 @@ static socket_t connect_target(const char *host, const char *port, unsigned char
             int pending = error == EINPROGRESS;
 #endif
             if (pending) {
-                pollfd_t writable = {fd, POLLOUT, 0};
-                int ready = poll_sockets(&writable, 1, CONNECT_TIMEOUT_SECONDS * 1000);
+                int ready;
+                do {
+                    ready = wait_for_connect(fd, remaining_milliseconds(deadline_ms));
+                } while (ready < 0 && interrupted(socket_error()) &&
+                         remaining_milliseconds(deadline_ms));
                 if (ready > 0) {
                     int so_error = 0;
                     socklen_t error_length = (socklen_t)sizeof(so_error);
@@ -223,6 +275,10 @@ static socket_t connect_target(const char *host, const char *port, unsigned char
                         error = so_error;
                         connected = error == 0;
                     }
+                } else if (ready == 0) {
+                    *status = 4; /* Host unreachable after the connection deadline. */
+                } else {
+                    error = socket_error();
                 }
             }
             if (!connected) {
@@ -230,10 +286,12 @@ static socket_t connect_target(const char *host, const char *port, unsigned char
                 if (error == WSAECONNREFUSED) *status = 5;
                 else if (error == WSAENETUNREACH) *status = 3;
                 else if (error == WSAEHOSTUNREACH) *status = 4;
+                else if (error == WSAETIMEDOUT) *status = 4;
 #else
                 if (error == ECONNREFUSED) *status = 5;
                 else if (error == ENETUNREACH) *status = 3;
                 else if (error == EHOSTUNREACH) *status = 4;
+                else if (error == ETIMEDOUT) *status = 4;
 #endif
             }
         }
@@ -248,55 +306,80 @@ static socket_t connect_target(const char *host, const char *port, unsigned char
     return result;
 }
 
+struct relay_buffer {
+    unsigned char data[16384];
+    size_t offset, length;
+    int read_open, write_shutdown;
+};
+
 static void relay(socket_t client, socket_t target) {
-    unsigned char buffer[16384];
-    int client_open = 1, target_open = 1;
-    while (client_open || target_open) {
-        pollfd_t readable[2];
+    socket_t sockets[2] = {client, target};
+    struct relay_buffer buffers[2] = {
+        {.read_open = 1}, {.read_open = 1}
+    };
+    if (!set_nonblocking(client, 1) || !set_nonblocking(target, 1)) return;
+    uint64_t deadline_ms = monotonic_milliseconds() + IDLE_TIMEOUT_SECONDS * 1000;
+    for (;;) {
+        pollfd_t fds[2];
+        int indices[2] = {-1, -1};
         unsigned int count = 0;
-        int client_index = -1, target_index = -1;
-        if (client_open) {
-            client_index = (int)count;
-            readable[count++] = (pollfd_t){client, POLLIN, 0};
-        }
-        if (target_open) {
-            target_index = (int)count;
-            readable[count++] = (pollfd_t){target, POLLIN, 0};
-        }
-        int ready = poll_sockets(readable, count, IDLE_TIMEOUT_SECONDS * 1000);
-        if (ready < 0) {
-            if (interrupted(socket_error())) continue;
-            break;
-        }
-        if (ready == 0) break;
-        if (client_open && readable[client_index].revents) {
-            int n = recv(client, (char *)buffer, sizeof(buffer), 0);
-            if (n > 0) {
-                if (!send_all(target, buffer, (size_t)n)) break;
-            } else if (n < 0 && interrupted(socket_error())) {
-                continue;
-            } else {
-                client_open = 0;
+        for (int i = 0; i < 2; ++i) {
+            struct relay_buffer *buffer = &buffers[i];
+            if (!buffer->read_open && !buffer->length && !buffer->write_shutdown) {
 #ifdef _WIN32
-                shutdown(target, SD_SEND);
+                shutdown(sockets[1 - i], SD_SEND);
 #else
-                shutdown(target, SHUT_WR);
+                shutdown(sockets[1 - i], SHUT_WR);
 #endif
+                buffer->write_shutdown = 1;
+            }
+            short events = 0;
+            if (buffer->read_open && buffer->length < sizeof(buffer->data)) events |= POLLIN;
+            if (buffers[1 - i].length) events |= POLLOUT;
+            if (events) {
+                indices[i] = (int)count;
+                fds[count++] = (pollfd_t){sockets[i], events, 0};
             }
         }
-        if (target_open && readable[target_index].revents) {
-            int n = recv(target, (char *)buffer, sizeof(buffer), 0);
-            if (n > 0) {
-                if (!send_all(client, buffer, (size_t)n)) break;
-            } else if (n < 0 && interrupted(socket_error())) {
-                continue;
-            } else {
-                target_open = 0;
-#ifdef _WIN32
-                shutdown(client, SD_SEND);
-#else
-                shutdown(client, SHUT_WR);
-#endif
+        int timeout_ms = remaining_milliseconds(deadline_ms);
+        if (!count || !timeout_ms) return;
+        int ready = poll_sockets(fds, count, timeout_ms);
+        if (ready < 0 && interrupted(socket_error())) continue;
+        if (ready <= 0) return;
+
+        for (int i = 0; i < 2; ++i) {
+            if (indices[i] < 0) continue;
+            short events = fds[indices[i]].revents;
+            if (events & POLLNVAL) return;
+            struct relay_buffer *out = &buffers[1 - i];
+            if (out->length && (events & (POLLOUT | POLLERR | POLLHUP))) {
+                int n = send(sockets[i], (const char *)out->data + out->offset,
+                             (int)out->length, 0);
+                if (n > 0) {
+                    out->offset += (size_t)n;
+                    out->length -= (size_t)n;
+                    deadline_ms = monotonic_milliseconds() + IDLE_TIMEOUT_SECONDS * 1000;
+                } else if (n == 0 || (!interrupted(socket_error()) && !would_block(socket_error()))) {
+                    return;
+                }
+            }
+            struct relay_buffer *in = &buffers[i];
+            if (in->read_open && in->length < sizeof(in->data) &&
+                (events & (POLLIN | POLLERR | POLLHUP))) {
+                if (in->offset) {
+                    memmove(in->data, in->data + in->offset, in->length);
+                    in->offset = 0;
+                }
+                int n = recv(sockets[i], (char *)in->data + in->length,
+                             (int)(sizeof(in->data) - in->length), 0);
+                if (n > 0) {
+                    in->length += (size_t)n;
+                    deadline_ms = monotonic_milliseconds() + IDLE_TIMEOUT_SECONDS * 1000;
+                } else if (n == 0) {
+                    in->read_open = 0;
+                } else if (!interrupted(socket_error()) && !would_block(socket_error())) {
+                    return;
+                }
             }
         }
     }
@@ -393,31 +476,31 @@ static int known_udp_destination(const struct udp_destination *destinations,
     return 0;
 }
 
-static void forward_udp_request(const unsigned char *packet, size_t length,
+static int forward_udp_request(const unsigned char *packet, size_t length,
                                 socket_t *ipv4, socket_t *ipv6,
                                 struct udp_destination *destinations) {
     char host[256], port[6];
     size_t offset = 4, address_size;
     int family;
     if (length < 4 || packet[0] != 0 || packet[1] != 0 || packet[2] != 0)
-        return; /* Fragmented UDP datagrams are not supported. */
+        return 0; /* Fragmented UDP datagrams are not supported. */
     if (packet[3] == 1 || packet[3] == 4) {
         family = packet[3] == 1 ? AF_INET : AF_INET6;
         address_size = family == AF_INET ? 4 : 16;
         if (length < offset + address_size + 2 ||
-            !inet_ntop(family, packet + offset, host, sizeof(host))) return;
+            !inet_ntop(family, packet + offset, host, sizeof(host))) return 0;
         offset += address_size;
     } else if (packet[3] == 3) {
-        if (length < offset + 1 || packet[offset] == 0) return;
+        if (length < offset + 1 || packet[offset] == 0) return 0;
         address_size = packet[offset++];
         if (length < offset + address_size + 2 ||
-            memchr(packet + offset, '\0', address_size) != NULL) return;
+            memchr(packet + offset, '\0', address_size) != NULL) return 0;
         memcpy(host, packet + offset, address_size);
         host[address_size] = '\0';
         offset += address_size;
         family = AF_UNSPEC;
     } else {
-        return;
+        return 0;
     }
     snprintf(port, sizeof(port), "%u", (unsigned)(packet[offset] << 8 | packet[offset + 1]));
     offset += 2;
@@ -427,27 +510,33 @@ static void forward_udp_request(const unsigned char *packet, size_t length,
     hints.ai_family = family;
     hints.ai_socktype = SOCK_DGRAM;
     hints.ai_protocol = IPPROTO_UDP;
-    if (getaddrinfo(host, port, &hints, &addresses) != 0) return;
+    hints.ai_flags = AI_NUMERICSERV | (family == AF_UNSPEC ? 0 : AI_NUMERICHOST);
+    if (getaddrinfo(host, port, &hints, &addresses) != 0) return 0;
+    int forwarded = 0;
     for (struct addrinfo *address = addresses; address; address = address->ai_next) {
         socket_t *outbound = address->ai_family == AF_INET ? ipv4 : ipv6;
         if (address->ai_family != AF_INET && address->ai_family != AF_INET6) continue;
         if (*outbound == INVALID_FD) {
             *outbound = socket(address->ai_family, SOCK_DGRAM, IPPROTO_UDP);
-            if (*outbound != INVALID_FD)
-                set_socket_timeout(*outbound, IDLE_TIMEOUT_SECONDS);
+            if (*outbound != INVALID_FD && !set_nonblocking(*outbound, 1)) {
+                close_socket(*outbound);
+                *outbound = INVALID_FD;
+            }
         }
         if (*outbound != INVALID_FD &&
             sendto(*outbound, (const char *)packet + offset, (int)(length - offset), 0,
                    address->ai_addr, (socklen_t)address->ai_addrlen) >= 0) {
             remember_udp_destination(destinations, address->ai_addr,
                                      (socklen_t)address->ai_addrlen);
+            forwarded = 1;
             break;
         }
     }
     freeaddrinfo(addresses);
+    return forwarded;
 }
 
-static void forward_udp_reply(socket_t outbound, socket_t association,
+static int forward_udp_reply(socket_t outbound, socket_t association,
                               const struct sockaddr_storage *client_address,
                               unsigned char *packet,
                               const struct udp_destination *destinations) {
@@ -455,9 +544,9 @@ static void forward_udp_reply(socket_t outbound, socket_t association,
     socklen_t source_length = (socklen_t)sizeof(source);
     int count = recvfrom(outbound, (char *)packet + 22, UDP_BUFFER_SIZE - 22, 0,
                          (struct sockaddr *)&source, &source_length);
-    if (count < 0) return;
+    if (count < 0) return 0;
     normalize_ipv4_mapped(&source);
-    if (!known_udp_destination(destinations, &source)) return;
+    if (!known_udp_destination(destinations, &source)) return 0;
     size_t header_length;
     unsigned char *reply;
     if (source.ss_family == AF_INET) {
@@ -475,13 +564,15 @@ static void forward_udp_reply(socket_t outbound, socket_t association,
         memcpy(reply + 4, &ipv6->sin6_addr, 16);
         memcpy(reply + 20, &ipv6->sin6_port, 2);
     } else {
-        return;
+        return 0;
     }
     reply[0] = 0;
     reply[1] = 0;
     reply[2] = 0;
-    (void)sendto(association, (const char *)reply, count + (int)header_length, 0,
-                 (const struct sockaddr *)client_address, address_length(client_address));
+    int reply_length = count + (int)header_length;
+    return sendto(association, (const char *)reply, reply_length, 0,
+                  (const struct sockaddr *)client_address,
+                  address_length(client_address)) == reply_length;
 }
 
 static void udp_associate(socket_t client, unsigned short requested_port) {
@@ -498,14 +589,15 @@ static void udp_associate(socket_t client, unsigned short requested_port) {
     set_address_port(&local, 0);
     association = socket(local.ss_family, SOCK_DGRAM, IPPROTO_UDP);
     if (association == INVALID_FD ||
-        bind(association, (struct sockaddr *)&local, address_length(&local)) != 0)
+        bind(association, (struct sockaddr *)&local, address_length(&local)) != 0 ||
+        !set_nonblocking(association, 1))
         goto failed;
     send_reply(client, 0, association);
-    set_socket_timeout(client, IDLE_TIMEOUT_SECONDS);
-    set_socket_timeout(association, IDLE_TIMEOUT_SECONDS);
+    if (!set_nonblocking(client, 1)) goto done;
 
     unsigned char packet[UDP_BUFFER_SIZE];
     int client_known = 0;
+    uint64_t deadline_ms = monotonic_milliseconds() + IDLE_TIMEOUT_SECONDS * 1000;
     for (;;) {
         pollfd_t readable[4] = {
             {client, POLLIN, 0},
@@ -521,7 +613,9 @@ static void udp_associate(socket_t client, unsigned short requested_port) {
             ipv6_index = (int)count;
             readable[count++] = (pollfd_t){ipv6, POLLIN, 0};
         }
-        int ready = poll_sockets(readable, count, IDLE_TIMEOUT_SECONDS * 1000);
+        int timeout_ms = remaining_milliseconds(deadline_ms);
+        if (!timeout_ms) break;
+        int ready = poll_sockets(readable, count, timeout_ms);
         if (ready < 0) {
             if (interrupted(socket_error())) continue;
             break;
@@ -530,7 +624,8 @@ static void udp_associate(socket_t client, unsigned short requested_port) {
         if (readable[0].revents) {
             /* The TCP control connection defines the association lifetime. */
             int count = recv(client, (char *)packet, sizeof(packet), 0);
-            if (count <= 0 && !(count < 0 && interrupted(socket_error()))) break;
+            if (count == 0 || (count < 0 && !interrupted(socket_error()) &&
+                              !would_block(socket_error()))) break;
         }
         if (readable[1].revents) {
             struct sockaddr_storage source;
@@ -542,17 +637,21 @@ static void udp_associate(socket_t client, unsigned short requested_port) {
                 if (same_ip(&peer, &source) &&
                     (!requested_port || address_port(&source) == requested_port) &&
                     (!client_known || address_port(&source) == address_port(&udp_client))) {
-                    udp_client = source;
-                    client_known = 1;
-                    forward_udp_request(packet, (size_t)count, &ipv4, &ipv6,
-                                        destinations);
+                    if (forward_udp_request(packet, (size_t)count, &ipv4, &ipv6,
+                                            destinations)) {
+                        udp_client = source;
+                        client_known = 1;
+                        deadline_ms = monotonic_milliseconds() + IDLE_TIMEOUT_SECONDS * 1000;
+                    }
                 }
             }
         }
         if (client_known && ipv4_index >= 0 && readable[ipv4_index].revents)
-            forward_udp_reply(ipv4, association, &udp_client, packet, destinations);
+            if (forward_udp_reply(ipv4, association, &udp_client, packet, destinations))
+                deadline_ms = monotonic_milliseconds() + IDLE_TIMEOUT_SECONDS * 1000;
         if (client_known && ipv6_index >= 0 && readable[ipv6_index].revents)
-            forward_udp_reply(ipv6, association, &udp_client, packet, destinations);
+            if (forward_udp_reply(ipv6, association, &udp_client, packet, destinations))
+                deadline_ms = monotonic_milliseconds() + IDLE_TIMEOUT_SECONDS * 1000;
     }
     goto done;
 failed:
@@ -567,6 +666,7 @@ static void handle_client(socket_t client) {
     unsigned char header[4], methods[255], address[16], port_bytes[2];
     char host[256], port[6];
     socket_t target = INVALID_FD;
+    int host_family = AF_UNSPEC;
     uint64_t deadline_ms = monotonic_milliseconds() + HANDSHAKE_TIMEOUT_SECONDS * 1000;
     set_socket_timeout(client, HANDSHAKE_TIMEOUT_SECONDS);
 
@@ -586,6 +686,7 @@ static void handle_client(socket_t client) {
     }
     if (header[3] == 1 || header[3] == 4) {
         int family = header[3] == 1 ? AF_INET : AF_INET6;
+        host_family = family;
         size_t length = family == AF_INET ? 4 : 16;
         if (!recv_all(client, address, length, deadline_ms)) goto done;
         if (!inet_ntop(family, address, host, sizeof(host))) goto done;
@@ -608,11 +709,9 @@ static void handle_client(socket_t client) {
     }
 
     unsigned char status;
-    target = connect_target(host, port, &status);
+    target = connect_target(host, port, host_family, &status);
     send_reply(client, status, target);
     if (target == INVALID_FD) goto done;
-    set_socket_timeout(client, IDLE_TIMEOUT_SECONDS);
-    set_socket_timeout(target, IDLE_TIMEOUT_SECONDS);
     relay(client, target);
 
 done:

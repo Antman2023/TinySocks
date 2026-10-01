@@ -4,7 +4,7 @@
 
 ## 自动编译与发布
 
-推送到 `master`、提交 Pull Request 或手动运行 GitHub Actions 时，会自动编译以下版本。编译结果可在对应的 Actions 运行页面下载。
+推送到 `master`、提交 Pull Request 或手动运行 GitHub Actions 时，会先在 Linux、Windows 和 macOS 上运行协议回归测试，通过后自动编译以下版本。编译结果可在对应的 Actions 运行页面下载。
 
 | 系统 | 架构 | 发布文件 |
 | --- | --- | --- |
@@ -68,6 +68,22 @@ tinysocks [监听地址 [端口]]
 
 默认监听 `0.0.0.0:1080`。例如，仅允许本机连接时运行 `tinysocks 127.0.0.1 1080`。
 
-可用 `curl --socks5-hostname 127.0.0.1:1080 http://example.com/` 测试 TCP 转发。UDP 客户端通过 TCP 建立 `UDP ASSOCIATE` 后，向回复中的地址和端口发送 SOCKS5 UDP 数据报；TCP 连接关闭时 UDP 会话随之结束。仅接受来自该 TCP 客户端地址及指定 UDP 端口的数据报；请求端口为 0 时使用首个数据报的来源端口。UDP 回复必须来自最近 60 秒内成功转发过的目标地址和端口，每个会话最多记录 64 个目标。UDP 分片（`FRAG` 非 0）不受支持。
+可用 `curl --socks5-hostname 127.0.0.1:1080 http://example.com/` 测试 TCP 转发。TCP 使用非阻塞双向转发，每个方向最多缓存 16 KiB；接收端变慢时仍可处理反向流量。支持 TCP 半关闭，已接收的数据发送完毕后才向另一端传递 EOF。
 
-最多同时处理 64 个客户端会话；握手须在 15 秒内完成，已建立的 TCP 或 UDP 会话连续空闲 5 分钟后关闭。可在编译时用 `-DMAX_CLIENTS=数量`、`-DHANDSHAKE_TIMEOUT_SECONDS=秒数` 和 `-DIDLE_TIMEOUT_SECONDS=秒数` 调整。代理不提供身份认证；监听公网地址时，请自行限制访问来源。
+UDP 客户端通过 TCP 建立 `UDP ASSOCIATE` 后，向回复中的地址和端口发送 SOCKS5 UDP 数据报；TCP 连接关闭时 UDP 会话随之结束。仅接受来自该 TCP 客户端地址及指定 UDP 端口的数据报；请求端口为 0 时，使用首个成功转发的有效数据报的来源端口。无效报文不会锁定端口。UDP 回复必须来自最近 60 秒内成功转发过的目标地址和端口，每个会话最多记录 64 个目标。UDP 分片（`FRAG` 非 0）不受支持。
+
+最多同时处理 64 个客户端会话；握手须在 15 秒内完成，目标连接的全部候选地址共享 10 秒连接预算。域名解析使用系统同步解析器，不计入连接预算。已建立的 TCP 或 UDP 会话连续空闲 5 分钟后关闭；无效或来源不符的 UDP 报文，以及 UDP 会话的 TCP 控制数据，不会刷新空闲计时。
+
+可在编译时用 `-DMAX_CLIENTS=数量`、`-DHANDSHAKE_TIMEOUT_SECONDS=秒数`、`-DCONNECT_TIMEOUT_SECONDS=秒数` 和 `-DIDLE_TIMEOUT_SECONDS=秒数` 调整。参数必须为正数，超时还须满足毫秒值不超过 `INT_MAX`。代理不提供身份认证；监听公网地址时，请自行限制访问来源。
+
+## 测试
+
+安装 Zig、GNU Make 和 Python 3 后运行：
+
+```sh
+make test
+```
+
+测试会自动编译专用程序，使用 2 个客户端、1 秒握手和 3 秒空闲限制。覆盖协议拒绝、分段握手与应用数据连发、IPv4/IPv6/域名目标、双向转发背压、大数据半关闭、客户端数量限制，以及 UDP 来源校验、端口锁定、空闲超时和会话回收；不需要访问外网。IPv6 回环不可用时跳过相应测试。
+
+Windows 上默认使用 `python`，其他平台使用 `python3`；可通过 `make test PYTHON=解释器路径` 指定解释器。
