@@ -119,10 +119,14 @@ class ProxyTests(unittest.TestCase):
                 self.assert_closed(control)
 
     def test_connection_refused(self):
-        with socket.socket() as reservation, self.control() as control:
-            reservation.bind(("127.0.0.1", 0))
+        with self.control() as control:
+            with socket.socket() as reservation:
+                reservation.bind(("127.0.0.1", 0))
+                target_port = reservation.getsockname()[1]
+            # Close the reservation before connecting: macOS can leave a connect
+            # pending when the destination socket is bound but not listening.
             control.sendall(b"\x05\x01\x00" +
-                            encode_address("127.0.0.1", reservation.getsockname()[1]))
+                            encode_address("127.0.0.1", target_port))
             header, _ = read_reply(control)
             self.assertEqual(header[:3], b"\x05\x05\x00")
             self.assert_closed(control)
