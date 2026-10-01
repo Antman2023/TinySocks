@@ -1,5 +1,6 @@
 """End-to-end checks for a build with limits of 2 clients, 1s handshake, 3s idle."""
 
+import random
 import socket
 import struct
 import subprocess
@@ -46,37 +47,45 @@ def read_reply(sock):
     return header, (host, struct.unpack("!H", recv_exact(sock, 2))[0])
 
 
-class ProxyTests(unittest.TestCase):
-    def setUp(self):
-        reservation = socket.socket()
-        reservation.bind(("127.0.0.1", 0))
-        self.port = reservation.getsockname()[1]
-        reservation.close()
-        self.proxy = subprocess.Popen(
-            [str(BINARY), "127.0.0.1", str(self.port)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        deadline = time.monotonic() + 3
-        while time.monotonic() < deadline:
-            if self.proxy.poll() is not None:
-                self.fail("proxy exited before listening")
-            try:
-                probe = socket.create_connection(("127.0.0.1", self.port), 0.1)
-                probe.close()
-                break
-            except OSError:
-                time.sleep(0.02)
-        else:
-            self.fail("proxy did not start")
-        time.sleep(0.05)
+class ProxyTestCase(unittest.TestCase):
+    listen_host = "127.0.0.1"
 
-    def tearDown(self):
-        self.proxy.terminate()
+    def setUp(self):
+        if ":" in self.listen_host:
+            try:
+                with socket.socket(socket.AF_INET6) as probe:
+                    probe.bind((self.listen_host, 0))
+            except OSError:
+                self.skipTest("IPv6 loopback is unavailable")
+        self.proxy = subprocess.Popen(
+            [str(BINARY), self.listen_host, "0"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.addCleanup(self.proxy.stderr.close)
+        self.addCleanup(self.stop_proxy)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            try:
+                line = pool.submit(self.proxy.stderr.readline).result(timeout=3)
+                self.assertTrue(line.startswith("SOCKS5 listening on "), line)
+                self.port = int(line.rsplit(":", 1)[1])
+                self.assertGreater(self.port, 0)
+                self.assertLessEqual(self.port, 65535)
+                host = f"[{self.listen_host}]" if ":" in self.listen_host else self.listen_host
+                self.assertEqual(line.strip(), f"SOCKS5 listening on {host}:{self.port}")
+            except BaseException:
+                # Unblock readline before joining the executor on startup failure.
+                self.stop_proxy()
+                raise
+
+    def stop_proxy(self):
+        if self.proxy.poll() is None:
+            self.proxy.terminate()
         self.proxy.wait(timeout=3)
 
     def control(self):
-        sock = socket.create_connection(("127.0.0.1", self.port), 2)
+        sock = socket.create_connection((self.listen_host, self.port), 2)
         self.addCleanup(sock.close)
         sock.settimeout(5)
         sock.sendall(GREETING)
@@ -95,11 +104,64 @@ class ProxyTests(unittest.TestCase):
         except ConnectionError:
             pass
 
+
+class CommandLineTests(unittest.TestCase):
+    def test_help(self):
+        for flag in ["--help", "-h"]:
+            with self.subTest(flag=flag):
+                result = subprocess.run([str(BINARY), flag], capture_output=True,
+                                        text=True, timeout=3)
+                self.assertEqual(result.returncode, 0)
+                self.assertIn("Usage:", result.stdout)
+                self.assertIn("port 0", result.stdout)
+                self.assertEqual(result.stderr, "")
+
+    def test_invalid_ports(self):
+        for port in ["", "-1", "65536", "65537", "99999999999999999999",
+                     "+1080", " 1080", "1080 ", "http", "1.5", "0x438"]:
+            with self.subTest(port=port):
+                result = subprocess.run([str(BINARY), "127.0.0.1", port],
+                                        capture_output=True, text=True, timeout=3)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Invalid port", result.stderr)
+
+    def test_empty_listen_address(self):
+        result = subprocess.run([str(BINARY), "", "0"], capture_output=True,
+                                text=True, timeout=3)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Invalid listen address", result.stderr)
+
+    def test_excess_arguments(self):
+        result = subprocess.run([str(BINARY), "127.0.0.1", "0", "extra"],
+                                capture_output=True, text=True, timeout=3)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Usage:", result.stderr)
+
+
+class ProxyTests(ProxyTestCase):
     def test_authentication_rejection(self):
         with socket.create_connection(("127.0.0.1", self.port), 2) as control:
             control.sendall(b"\x05\x01\x02")
             self.assertEqual(recv_exact(control, 2), b"\x05\xff")
             self.assert_closed(control)
+
+    def test_maximum_authentication_methods(self):
+        with socket.create_connection((self.listen_host, self.port), 2) as control:
+            control.settimeout(2)
+            control.sendall(b"\x05\xff" + b"\x02" * 254 + b"\x00")
+            self.assertEqual(recv_exact(control, 2), b"\x05\x00")
+            control.sendall(b"\x05\x02\x00\x01")
+            self.assertEqual(read_reply(control)[0][:3], b"\x05\x07\x00")
+            self.assert_closed(control)
+
+    def test_truncated_greeting(self):
+        for greeting in [b"\x05", b"\x05\x01", b"\x05\xff" + b"\x02" * 254]:
+            with self.subTest(greeting=greeting), \
+                 socket.create_connection((self.listen_host, self.port), 2) as control:
+                control.settimeout(2)
+                control.sendall(greeting)
+                control.shutdown(socket.SHUT_WR)
+                self.assert_closed(control)
 
     def test_unsupported_command_and_address(self):
         for request, status in [(b"\x05\x02\x00\x01", 7),
@@ -149,6 +211,28 @@ class ProxyTests(unittest.TestCase):
                 with listener.accept()[0] as target:
                     target.settimeout(2)
                     self.assertEqual(recv_exact(target, 9), b"pipelined")
+
+    def test_pipelined_handshake_and_half_close(self):
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            listener.settimeout(2)
+            with socket.create_connection((self.listen_host, self.port), 2) as control:
+                control.settimeout(2)
+                control.sendall(GREETING + b"\x05\x01\x00" +
+                                encode_address("127.0.0.1", listener.getsockname()[1]) +
+                                b"request before FIN")
+                control.shutdown(socket.SHUT_WR)
+                self.assertEqual(recv_exact(control, 2), b"\x05\x00")
+                self.assertEqual(read_reply(control)[0][:3], b"\x05\x00\x00")
+                with listener.accept()[0] as target:
+                    target.settimeout(2)
+                    self.assertEqual(recv_exact(target, 18), b"request before FIN")
+                    self.assertEqual(target.recv(1), b"")
+                    target.sendall(b"response after FIN")
+                    target.shutdown(socket.SHUT_WR)
+                    self.assertEqual(recv_exact(control, 18), b"response after FIN")
+                    self.assert_closed(control)
 
     def test_ipv6_connect(self):
         with socket.socket(socket.AF_INET6) as listener:
@@ -200,7 +284,9 @@ class ProxyTests(unittest.TestCase):
                     control.shutdown(socket.SHUT_RDWR)
 
     def test_tcp_large_payload_drains_before_half_close(self):
-        payload = bytes(range(256)) * 4096
+        # An aperiodic pattern exposes byte loss or reordering at buffer wraps.
+        size = 1024 * 1024 + 137
+        payload = random.Random(0).getrandbits(size * 8).to_bytes(size, "little")
         with socket.socket() as listener:
             listener.bind(("127.0.0.1", 0))
             listener.listen()
@@ -240,7 +326,14 @@ class ProxyTests(unittest.TestCase):
             client.bind(("127.0.0.1", 0))
             target.bind(("127.0.0.1", 0))
             target.settimeout(2)
-            rogue.sendto(b"invalid", relay)
+            malformed = [b"", b"invalid", b"\x00\x00\x00\x09",
+                         b"\x01\x00\x00\x01" + b"\x00" * 6,
+                         b"\x00\x00\x00\x01\x7f\x00\x00\x01\x00",
+                         b"\x00\x00\x00\x04" + b"\x00" * 17,
+                         b"\x00\x00\x00\x03\x00\x00\x00",
+                         b"\x00\x00\x00\x03\x03a\x00b\x00\x01"]
+            for packet in malformed:
+                rogue.sendto(packet, relay)
             time.sleep(0.1)
             request = b"\x00\x00\x00" + encode_address(*target.getsockname()) + b"valid"
             client.sendto(request, relay)
@@ -318,6 +411,25 @@ class ProxyTests(unittest.TestCase):
             self.assertEqual(client.recvfrom(100)[0],
                              b"\x00\x00\x00" + encode_address(*target.getsockname()))
 
+    def test_udp_numeric_payload_sizes(self):
+        with self.control() as control, \
+             socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client, \
+             socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as target:
+            relay = self.associate(control)
+            target.bind(("127.0.0.1", 0))
+            target.settimeout(2)
+            client.settimeout(2)
+            header = b"\x00\x00\x00" + encode_address(*target.getsockname())
+            # Stay within platforms' default UDP send-buffer limits.
+            large_payload = random.Random(1).getrandbits(8192 * 8).to_bytes(8192, "little")
+            for payload in [b"", large_payload]:
+                with self.subTest(size=len(payload)):
+                    client.sendto(header + payload, relay)
+                    data, outbound = target.recvfrom(65536)
+                    self.assertEqual(data, payload)
+                    target.sendto(data, outbound)
+                    self.assertEqual(client.recvfrom(65536)[0], header + payload)
+
     def test_udp_ipv6_target(self):
         with self.control() as control, \
              socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client, \
@@ -335,6 +447,43 @@ class ProxyTests(unittest.TestCase):
             target.sendto(data, outbound)
             client.settimeout(2)
             self.assertEqual(client.recvfrom(100)[0], b"\x00\x00\x00" + request_address + b"ipv6")
+
+    def test_udp_ipv4_mapped_ipv6_target(self):
+        with self.control() as control, \
+             socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client, \
+             socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as target:
+            relay = self.associate(control)
+            target.bind(("127.0.0.1", 0))
+            target.settimeout(2)
+            client.settimeout(2)
+            for domain in [False, True]:
+                with self.subTest(domain=domain):
+                    client.sendto(b"\x00\x00\x00" +
+                                  encode_address("::ffff:127.0.0.1", target.getsockname()[1],
+                                                 domain=domain) + b"mapped", relay)
+                    data, outbound = target.recvfrom(100)
+                    self.assertEqual(data, b"mapped")
+                    target.sendto(data, outbound)
+                    self.assertEqual(client.recvfrom(100)[0], b"\x00\x00\x00" +
+                                     encode_address(*target.getsockname()) + b"mapped")
+
+    def test_udp_control_data_does_not_extend_idle_timeout(self):
+        with self.control() as control:
+            self.associate(control)
+            start = time.monotonic()
+            control.settimeout(0.1)
+            while time.monotonic() - start < 4:
+                try:
+                    control.sendall(b"ignored control data")
+                    if control.recv(1) == b"":
+                        break
+                except socket.timeout:
+                    continue
+                except ConnectionError:
+                    break
+            else:
+                self.fail("TCP control data kept an idle UDP association alive")
+            self.assertGreaterEqual(time.monotonic() - start, 2.5)
 
     def test_udp_valid_traffic_refreshes_idle_timeout(self):
         with self.control() as control, \
@@ -454,6 +603,41 @@ class ProxyTests(unittest.TestCase):
                     self.assertEqual(target.recv(1), b"")
                     target.sendall(b"tail")
                     self.assertEqual(recv_exact(control, 4), b"tail")
+
+
+class IPv6ProxyTests(ProxyTestCase):
+    listen_host = "::1"
+
+    def test_ipv6_listener_tcp(self):
+        with socket.socket() as listener, self.control() as control:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            listener.settimeout(2)
+            control.sendall(b"\x05\x01\x00" +
+                            encode_address("127.0.0.1", listener.getsockname()[1]))
+            self.assertEqual(read_reply(control)[0][:3], b"\x05\x00\x00")
+            with listener.accept()[0] as target:
+                target.settimeout(2)
+                control.sendall(b"ipv6 listener")
+                self.assertEqual(recv_exact(target, 13), b"ipv6 listener")
+                target.sendall(b"reply")
+                self.assertEqual(recv_exact(control, 5), b"reply")
+
+    def test_ipv6_listener_udp(self):
+        with self.control() as control, \
+             socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as client, \
+             socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as target:
+            relay = self.associate(control)
+            self.assertEqual(relay[0], "::1")
+            target.bind(("127.0.0.1", 0))
+            target.settimeout(2)
+            client.settimeout(2)
+            request = b"\x00\x00\x00" + encode_address(*target.getsockname()) + b"ipv6 client"
+            client.sendto(request, relay)
+            data, outbound = target.recvfrom(100)
+            self.assertEqual(data, b"ipv6 client")
+            target.sendto(data, outbound)
+            self.assertEqual(client.recvfrom(100)[0], request)
 
 
 if __name__ == "__main__":
