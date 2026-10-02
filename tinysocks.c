@@ -226,17 +226,30 @@ static int send_reply(socket_t client, unsigned char status, socket_t outbound) 
     return send_all(client, reply, length, deadline_ms);
 }
 
-static socket_t connect_target(const char *host, const char *port, int family,
+static void normalize_ipv4_mapped(struct sockaddr_storage *address);
+static socklen_t address_length(const struct sockaddr_storage *address);
+static void set_address_port(struct sockaddr_storage *address, unsigned short port);
+
+static socket_t connect_target(const char *host, const char *port,
+                               const struct sockaddr_storage *numeric,
                                unsigned char *status) {
     struct addrinfo hints;
     struct addrinfo *addresses = NULL;
+    struct addrinfo numeric_address = {0};
+    struct sockaddr_storage numeric_endpoint;
     socket_t result = INVALID_FD;
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = family;
+    hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
-    hints.ai_flags = AI_NUMERICSERV | (family == AF_UNSPEC ? 0 : AI_NUMERICHOST);
-    if (getaddrinfo(host, port, &hints, &addresses) != 0) {
+    hints.ai_flags = AI_NUMERICSERV;
+    if (numeric) {
+        /* The SOCKS request already contains the binary address and port. */
+        numeric_endpoint = *numeric;
+        numeric_address.ai_addr = (struct sockaddr *)&numeric_endpoint;
+        numeric_address.ai_addrlen = address_length(&numeric_endpoint);
+        addresses = &numeric_address;
+    } else if (getaddrinfo(host, port, &hints, &addresses) != 0) {
         *status = 4; /* Host unreachable. */
         return INVALID_FD;
     }
@@ -249,14 +262,20 @@ static socket_t connect_target(const char *host, const char *port, int family,
             *status = 4;
             break;
         }
-        socket_t fd = socket(address->ai_family, address->ai_socktype, address->ai_protocol);
+        struct sockaddr_storage endpoint;
+        if ((size_t)address->ai_addrlen > sizeof(endpoint)) continue;
+        memset(&endpoint, 0, sizeof(endpoint));
+        memcpy(&endpoint, address->ai_addr, address->ai_addrlen);
+        normalize_ipv4_mapped(&endpoint);
+        if (endpoint.ss_family != AF_INET && endpoint.ss_family != AF_INET6) continue;
+        socket_t fd = socket(endpoint.ss_family, SOCK_STREAM, IPPROTO_TCP);
         if (fd == INVALID_FD) continue;
         if (!set_nonblocking(fd, 1)) {
             close_socket(fd);
             continue;
         }
 
-        int connected = connect(fd, address->ai_addr, (socklen_t)address->ai_addrlen) == 0;
+        int connected = connect(fd, (struct sockaddr *)&endpoint, address_length(&endpoint)) == 0;
         if (!connected) {
             int error = socket_error();
 #ifdef _WIN32
@@ -305,7 +324,7 @@ static socket_t connect_target(const char *host, const char *port, int family,
         }
         close_socket(fd);
     }
-    freeaddrinfo(addresses);
+    if (!numeric) freeaddrinfo(addresses);
     return result;
 }
 
@@ -694,10 +713,11 @@ done:
 }
 
 static void handle_client(socket_t client) {
-    unsigned char header[4], methods[255], address[16], port_bytes[2];
+    unsigned char header[4], methods[255], port_bytes[2];
     char host[256], port[6];
+    struct sockaddr_storage address;
+    memset(&address, 0, sizeof(address));
     socket_t target = INVALID_FD;
-    int host_family = AF_UNSPEC;
     uint64_t deadline_ms = monotonic_milliseconds() + HANDSHAKE_TIMEOUT_SECONDS * 1000;
     if (!set_nonblocking(client, 1)) goto done;
 
@@ -717,10 +737,12 @@ static void handle_client(socket_t client) {
     }
     if (header[3] == 1 || header[3] == 4) {
         int family = header[3] == 1 ? AF_INET : AF_INET6;
-        host_family = family;
+        address.ss_family = (unsigned short)family;
         size_t length = family == AF_INET ? 4 : 16;
-        if (!recv_all(client, address, length, deadline_ms)) goto done;
-        if (!inet_ntop(family, address, host, sizeof(host))) goto done;
+        unsigned char *bytes = family == AF_INET ?
+            (unsigned char *)&((struct sockaddr_in *)&address)->sin_addr :
+            (unsigned char *)&((struct sockaddr_in6 *)&address)->sin6_addr;
+        if (!recv_all(client, bytes, length, deadline_ms)) goto done;
     } else if (header[3] == 3) {
         unsigned char length;
         if (!recv_all(client, &length, 1, deadline_ms) || length == 0) goto done;
@@ -732,15 +754,21 @@ static void handle_client(socket_t client) {
         goto done;
     }
     if (!recv_all(client, port_bytes, 2, deadline_ms)) goto done;
-    snprintf(port, sizeof(port), "%u", (unsigned)(port_bytes[0] << 8 | port_bytes[1]));
+    unsigned short target_port = (unsigned short)(port_bytes[0] << 8 | port_bytes[1]);
 
     if (header[1] == 3) {
-        udp_associate(client, (unsigned short)(port_bytes[0] << 8 | port_bytes[1]));
+        udp_associate(client, target_port);
         goto done;
     }
 
     unsigned char status;
-    target = connect_target(host, port, host_family, &status);
+    if (header[3] == 3) {
+        snprintf(port, sizeof(port), "%u", (unsigned)target_port);
+        target = connect_target(host, port, NULL, &status);
+    } else {
+        set_address_port(&address, target_port);
+        target = connect_target(NULL, NULL, &address, &status);
+    }
     if (!send_reply(client, status, target)) goto done;
     if (target == INVALID_FD) goto done;
     relay(client, target);

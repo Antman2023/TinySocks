@@ -253,6 +253,26 @@ class ProxyTests(ProxyTestCase):
                     target.sendall(b"ipv6")
                     self.assertEqual(recv_exact(control, 4), b"ipv6")
 
+    def test_tcp_ipv4_mapped_ipv6_target(self):
+        for domain in [False, True]:
+            with self.subTest(domain=domain), socket.socket() as listener:
+                listener.bind(("127.0.0.1", 0))
+                listener.listen()
+                listener.settimeout(2)
+                with self.control() as control:
+                    control.sendall(b"\x05\x01\x00" +
+                                    encode_address("::ffff:127.0.0.1",
+                                                   listener.getsockname()[1], domain=domain))
+                    header, endpoint = read_reply(control)
+                    self.assertEqual(header, b"\x05\x00\x00\x01")
+                    self.assertEqual(endpoint[0], "127.0.0.1")
+                    with listener.accept()[0] as target:
+                        target.settimeout(2)
+                        control.sendall(b"mapped request")
+                        self.assertEqual(recv_exact(target, 14), b"mapped request")
+                        target.sendall(b"mapped reply")
+                        self.assertEqual(recv_exact(control, 12), b"mapped reply")
+
     def test_tcp_backpressure_keeps_reverse_direction_live(self):
         with socket.socket() as listener:
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16384)
@@ -361,6 +381,30 @@ class ProxyTests(ProxyTestCase):
             client.sendto(request, relay)
             target.settimeout(2)
             self.assertEqual(target.recvfrom(100)[0], b"valid")
+
+    def test_udp_failed_forward_does_not_pin_client(self):
+        with self.control() as control, \
+             socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as rogue, \
+             socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client, \
+             socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as target:
+            relay = self.associate(control)
+            rogue.bind(("127.0.0.1", 0))
+            client.bind(("127.0.0.1", 0))
+            target.bind(("127.0.0.1", 0))
+            # Broadcast sends fail because the proxy does not enable SO_BROADCAST.
+            for domain in [False, True]:
+                rogue.sendto(b"\x00\x00\x00" +
+                             encode_address("255.255.255.255", 12345, domain=domain) + b"unsendable",
+                             relay)
+            time.sleep(0.1)
+            request = b"\x00\x00\x00" + encode_address(*target.getsockname()) + b"valid"
+            client.sendto(request, relay)
+            target.settimeout(2)
+            data, outbound = target.recvfrom(100)
+            self.assertEqual(data, b"valid")
+            target.sendto(data, outbound)
+            client.settimeout(2)
+            self.assertEqual(client.recvfrom(100)[0], request)
 
     def test_udp_invalid_traffic_does_not_extend_idle_timeout(self):
         with self.control() as control, \
