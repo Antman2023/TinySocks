@@ -43,6 +43,8 @@ typedef int socket_t;
 #define UDP_DESTINATION_TTL_SECONDS 60
 #define UDP_DNS_CACHE_LIMIT 8
 #define UDP_DNS_CACHE_TTL_SECONDS 60
+#define CONNECT_FALLBACK_DELAY_MS 250
+#define CONNECT_PENDING_LIMIT 8
 
 #ifndef MAX_CLIENTS
 #define MAX_CLIENTS 64
@@ -167,19 +169,26 @@ static int set_nonblocking(socket_t fd, int enabled) {
 #endif
 }
 
-static int wait_for_connect(socket_t fd, int timeout_ms) {
+static int wait_for_connect(pollfd_t *fds, unsigned int count, int timeout_ms) {
 #ifdef _WIN32
     /* select reports failed connections in the exception set on older Winsock too. */
     fd_set writable, failed;
     FD_ZERO(&writable);
     FD_ZERO(&failed);
-    FD_SET(fd, &writable);
-    FD_SET(fd, &failed);
+    for (unsigned int i = 0; i < count; ++i) {
+        FD_SET(fds[i].fd, &writable);
+        FD_SET(fds[i].fd, &failed);
+        fds[i].revents = 0;
+    }
     struct timeval timeout = {timeout_ms / 1000, (timeout_ms % 1000) * 1000};
-    return select(0, NULL, &writable, &failed, &timeout);
+    int ready = select(0, NULL, &writable, &failed, &timeout);
+    if (ready > 0)
+        for (unsigned int i = 0; i < count; ++i)
+            if (FD_ISSET(fds[i].fd, &writable) || FD_ISSET(fds[i].fd, &failed))
+                fds[i].revents = POLLOUT;
+    return ready;
 #else
-    pollfd_t writable = {fd, POLLOUT, 0};
-    return poll_sockets(&writable, 1, timeout_ms);
+    return poll_sockets(fds, count, timeout_ms);
 #endif
 }
 
@@ -261,6 +270,36 @@ static void normalize_ipv4_mapped(struct sockaddr_storage *address);
 static socklen_t address_length(const struct sockaddr_storage *address);
 static void set_address_port(struct sockaddr_storage *address, unsigned short port);
 
+static unsigned char connect_error_status(int error) {
+#ifdef _WIN32
+    if (error == WSAEACCES) return 2;
+    if (error == WSAENETUNREACH) return 3;
+    if (error == WSAEHOSTUNREACH || error == WSAETIMEDOUT) return 4;
+    if (error == WSAECONNREFUSED) return 5;
+#else
+    if (error == EACCES || error == EPERM) return 2;
+    if (error == ENETUNREACH) return 3;
+    if (error == EHOSTUNREACH || error == ETIMEDOUT) return 4;
+    if (error == ECONNREFUSED) return 5;
+#endif
+    return 1;
+}
+
+/* Scan each family once, retaining the resolver's order within that family. */
+static struct addrinfo *next_connect_address(struct addrinfo **cursor, int family) {
+    while (*cursor) {
+        struct addrinfo *address = *cursor;
+        *cursor = address->ai_next;
+        if (!address->ai_addr || (size_t)address->ai_addrlen > sizeof(struct sockaddr_storage))
+            continue;
+        struct sockaddr_storage endpoint = {0};
+        memcpy(&endpoint, address->ai_addr, address->ai_addrlen);
+        normalize_ipv4_mapped(&endpoint);
+        if (endpoint.ss_family == family) return address;
+    }
+    return NULL;
+}
+
 static socket_t connect_target(const char *host, const char *port,
                                const struct sockaddr_storage *numeric,
                                unsigned char *status) {
@@ -286,75 +325,111 @@ static socket_t connect_target(const char *host, const char *port,
     }
 
     *status = 1; /* General failure. */
-    /* Share one connection budget across all resolved addresses. */
+    /* Stagger candidates within one budget, bounding sockets for small devices. */
     uint64_t deadline_ms = monotonic_milliseconds() + CONNECT_TIMEOUT_SECONDS * 1000;
+    uint64_t next_start_ms = monotonic_milliseconds();
+    struct addrinfo *cursors[2] = {addresses, addresses};
+    int family_index = 0;
+    struct addrinfo *first = next_connect_address(&cursors[0], AF_INET);
+    struct addrinfo *first_ipv6 = next_connect_address(&cursors[1], AF_INET6);
+    /* Keep the first usable resolver result as the preferred family. */
     for (struct addrinfo *address = addresses; address; address = address->ai_next) {
+        if (address == first || address == first_ipv6) {
+            family_index = address == first_ipv6;
+            break;
+        }
+    }
+    cursors[0] = first;
+    cursors[1] = first_ipv6;
+    pollfd_t pending[CONNECT_PENDING_LIMIT];
+    unsigned int count = 0;
+    while (cursors[0] || cursors[1] || count) {
         if (!remaining_milliseconds(deadline_ms)) {
             *status = 4;
             break;
         }
-        struct sockaddr_storage endpoint;
-        if ((size_t)address->ai_addrlen > sizeof(endpoint)) continue;
-        memset(&endpoint, 0, sizeof(endpoint));
-        memcpy(&endpoint, address->ai_addr, address->ai_addrlen);
-        normalize_ipv4_mapped(&endpoint);
-        if (endpoint.ss_family != AF_INET && endpoint.ss_family != AF_INET6) continue;
-        socket_t fd = socket(endpoint.ss_family, SOCK_STREAM, IPPROTO_TCP);
-        if (fd == INVALID_FD) continue;
-        if (!set_nonblocking(fd, 1)) {
-            close_socket(fd);
-            continue;
-        }
-
-        int connected = connect(fd, (struct sockaddr *)&endpoint, address_length(&endpoint)) == 0;
-        if (!connected) {
+        if (count < CONNECT_PENDING_LIMIT && (cursors[0] || cursors[1]) &&
+            (!count || monotonic_milliseconds() >= next_start_ms)) {
+            struct addrinfo *address = next_connect_address(&cursors[family_index],
+                                                            family_index ? AF_INET6 : AF_INET);
+            if (!address) {
+                family_index = 1 - family_index;
+                address = next_connect_address(&cursors[family_index],
+                                                family_index ? AF_INET6 : AF_INET);
+            }
+            if (!address) continue;
+            family_index = 1 - family_index;
+            struct sockaddr_storage endpoint = {0};
+            memcpy(&endpoint, address->ai_addr, address->ai_addrlen);
+            normalize_ipv4_mapped(&endpoint);
+            socket_t fd = socket(endpoint.ss_family, SOCK_STREAM, IPPROTO_TCP);
+            if (fd == INVALID_FD) {
+                *status = connect_error_status(socket_error());
+                next_start_ms = monotonic_milliseconds();
+                continue;
+            }
+            if (!set_nonblocking(fd, 1)) {
+                *status = connect_error_status(socket_error());
+                close_socket(fd);
+                next_start_ms = monotonic_milliseconds();
+                continue;
+            }
+            if (connect(fd, (struct sockaddr *)&endpoint, address_length(&endpoint)) == 0) {
+                result = fd;
+                break;
+            }
             int error = socket_error();
 #ifdef _WIN32
-            int pending = error == WSAEWOULDBLOCK || error == WSAEINPROGRESS;
+            int in_progress = error == WSAEWOULDBLOCK || error == WSAEINPROGRESS;
 #else
-            int pending = error == EINPROGRESS;
+            int in_progress = error == EINPROGRESS || error == EINTR;
 #endif
-            if (pending) {
-                int ready;
-                do {
-                    ready = wait_for_connect(fd, remaining_milliseconds(deadline_ms));
-                } while (ready < 0 && interrupted(socket_error()) &&
-                         remaining_milliseconds(deadline_ms));
-                if (ready > 0) {
-                    int so_error = 0;
-                    socklen_t error_length = (socklen_t)sizeof(so_error);
-                    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, (char *)&so_error,
-                                   &error_length) == 0) {
-                        error = so_error;
-                        connected = error == 0;
-                    }
-                } else if (ready == 0) {
-                    *status = 4; /* Host unreachable after the connection deadline. */
-                } else {
-                    error = socket_error();
-                }
+            if (in_progress) {
+                pending[count++] = (pollfd_t){fd, POLLOUT, 0};
+                next_start_ms = monotonic_milliseconds() + CONNECT_FALLBACK_DELAY_MS;
+            } else {
+                *status = connect_error_status(error);
+                close_socket(fd);
+                next_start_ms = monotonic_milliseconds();
             }
-            if (!connected) {
-#ifdef _WIN32
-                if (error == WSAECONNREFUSED) *status = 5;
-                else if (error == WSAENETUNREACH) *status = 3;
-                else if (error == WSAEHOSTUNREACH) *status = 4;
-                else if (error == WSAETIMEDOUT) *status = 4;
-#else
-                if (error == ECONNREFUSED) *status = 5;
-                else if (error == ENETUNREACH) *status = 3;
-                else if (error == EHOSTUNREACH) *status = 4;
-                else if (error == ETIMEDOUT) *status = 4;
-#endif
-            }
+            continue;
         }
-        if (connected) {
-            result = fd;
-            *status = 0;
+        if (!count) continue;
+        int timeout_ms = remaining_milliseconds(deadline_ms);
+        if (count < CONNECT_PENDING_LIMIT && (cursors[0] || cursors[1])) {
+            int delay_ms = remaining_milliseconds(next_start_ms);
+            if (delay_ms < timeout_ms) timeout_ms = delay_ms;
+        }
+        int ready = wait_for_connect(pending, count, timeout_ms);
+        if (ready < 0) {
+            int error = socket_error();
+            if (interrupted(error)) continue;
+            *status = connect_error_status(error);
             break;
         }
-        close_socket(fd);
+        for (unsigned int i = 0; i < count && ready > 0;) {
+            if (!pending[i].revents) {
+                ++i;
+                continue;
+            }
+            int error = 0;
+            socklen_t error_length = (socklen_t)sizeof(error);
+            if (getsockopt(pending[i].fd, SOL_SOCKET, SO_ERROR, (char *)&error,
+                           &error_length) != 0) error = socket_error();
+            if (!error && !(pending[i].revents & POLLNVAL)) {
+                result = pending[i].fd;
+                pending[i] = pending[--count];
+                goto connected;
+            }
+            *status = connect_error_status(error);
+            close_socket(pending[i].fd);
+            pending[i] = pending[--count];
+            next_start_ms = monotonic_milliseconds();
+        }
     }
+connected:
+    for (unsigned int i = 0; i < count; ++i) close_socket(pending[i].fd);
+    if (result != INVALID_FD) *status = 0;
     if (!numeric) freeaddrinfo(addresses);
     return result;
 }
