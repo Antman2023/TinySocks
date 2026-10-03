@@ -41,6 +41,8 @@ typedef int socket_t;
 #define UDP_BUFFER_SIZE 65536
 #define UDP_DESTINATION_LIMIT 64
 #define UDP_DESTINATION_TTL_SECONDS 60
+#define UDP_DNS_CACHE_LIMIT 8
+#define UDP_DNS_CACHE_TTL_SECONDS 60
 
 #ifndef MAX_CLIENTS
 #define MAX_CLIENTS 64
@@ -115,6 +117,35 @@ static int would_block(int error) {
     return error == WSAEWOULDBLOCK;
 #else
     return error == EAGAIN || error == EWOULDBLOCK;
+#endif
+}
+
+/* Errors for a pending client must not stop the listening socket. */
+static int accept_retry_delay(int error) {
+    if (interrupted(error) || would_block(error)) return 0;
+#ifdef _WIN32
+    if (error == WSAECONNRESET || error == WSAECONNABORTED) return 0;
+    if (error == WSAEMFILE || error == WSAENOBUFS || error == WSAENETDOWN) return 100;
+#else
+    if (error == ECONNABORTED) return 0;
+#ifdef __linux__
+    if (error == EPROTO || error == ENOPROTOOPT || error == EHOSTDOWN ||
+        error == ENONET || error == EHOSTUNREACH || error == EOPNOTSUPP ||
+        error == ENETUNREACH) return 0;
+#endif
+    if (error == EMFILE || error == ENFILE || error == ENOBUFS ||
+        error == ENOMEM || error == ENETDOWN) return 100;
+#endif
+    return -1;
+}
+
+static void retry_pause(int milliseconds) {
+    if (!milliseconds) return;
+#ifdef _WIN32
+    Sleep((DWORD)milliseconds);
+#else
+    struct timespec delay = {milliseconds / 1000, (milliseconds % 1000) * 1000000L};
+    while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {}
 #endif
 }
 
@@ -465,6 +496,12 @@ struct udp_destination {
     uint64_t expires_at_ms;
 };
 
+struct udp_dns_entry {
+    char host[256];
+    struct sockaddr_storage address;
+    uint64_t expires_at_ms;
+};
+
 static void remember_udp_destination(struct udp_destination *destinations,
                                      const struct sockaddr *address, socklen_t length) {
     struct sockaddr_storage endpoint;
@@ -526,7 +563,8 @@ static int send_udp_request(const unsigned char *payload, size_t length,
 
 static int forward_udp_request(const unsigned char *packet, size_t length,
                                 socket_t *ipv4, socket_t *ipv6,
-                                struct udp_destination *destinations) {
+                                struct udp_destination *destinations,
+                                struct udp_dns_entry *dns_cache) {
     char host[256], port[6];
     struct sockaddr_storage destination;
     memset(&destination, 0, sizeof(destination));
@@ -564,6 +602,20 @@ static int forward_udp_request(const unsigned char *packet, size_t length,
     }
     snprintf(port, sizeof(port), "%u", (unsigned)target_port);
 
+    uint64_t now = monotonic_milliseconds();
+    unsigned int slot = 0;
+    for (unsigned int i = 0; i < UDP_DNS_CACHE_LIMIT; ++i) {
+        if (dns_cache[i].expires_at_ms > now && !strcmp(dns_cache[i].host, host)) {
+            destination = dns_cache[i].address;
+            set_address_port(&destination, target_port);
+            if (send_udp_request(packet + offset, length - offset, &destination,
+                                 ipv4, ipv6, destinations)) return 1;
+            /* Retry resolution and other candidates after a cached send fails. */
+            dns_cache[i].expires_at_ms = 0;
+        }
+        if (dns_cache[i].expires_at_ms < dns_cache[slot].expires_at_ms) slot = i;
+    }
+
     struct addrinfo hints, *addresses = NULL;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
@@ -579,6 +631,10 @@ static int forward_udp_request(const unsigned char *packet, size_t length,
         memcpy(&destination, address->ai_addr, address->ai_addrlen);
         if (send_udp_request(packet + offset, length - offset, &destination,
                              ipv4, ipv6, destinations)) {
+            strcpy(dns_cache[slot].host, host);
+            dns_cache[slot].address = destination;
+            dns_cache[slot].expires_at_ms = monotonic_milliseconds() +
+                                          UDP_DNS_CACHE_TTL_SECONDS * 1000;
             forwarded = 1;
             break;
         }
@@ -629,6 +685,7 @@ static int forward_udp_reply(socket_t outbound, socket_t association,
 static void udp_associate(socket_t client, unsigned short requested_port) {
     struct sockaddr_storage local, peer, udp_client;
     struct udp_destination destinations[UDP_DESTINATION_LIMIT] = {{0}};
+    struct udp_dns_entry dns_cache[UDP_DNS_CACHE_LIMIT] = {{0}};
     socklen_t length = (socklen_t)sizeof(local);
     socket_t association = INVALID_FD, ipv4 = INVALID_FD, ipv6 = INVALID_FD;
     if (getsockname(client, (struct sockaddr *)&local, &length) != 0) goto failed;
@@ -688,7 +745,7 @@ static void udp_associate(socket_t client, unsigned short requested_port) {
                     (!requested_port || address_port(&source) == requested_port) &&
                     (!client_known || address_port(&source) == address_port(&udp_client))) {
                     if (forward_udp_request(packet, (size_t)count, &ipv4, &ipv6,
-                                            destinations)) {
+                                            destinations, dns_cache)) {
                         udp_client = source;
                         client_known = 1;
                         deadline_ms = monotonic_milliseconds() + IDLE_TIMEOUT_SECONDS * 1000;
@@ -889,8 +946,13 @@ int main(int argc, char **argv) {
     for (;;) {
         socket_t client = accept(listener, NULL, NULL);
         if (client == INVALID_FD) {
-            if (interrupted(socket_error())) continue;
-            fprintf(stderr, "accept failed: %d\n", socket_error());
+            int error = socket_error();
+            int delay = accept_retry_delay(error);
+            if (delay >= 0) {
+                retry_pause(delay);
+                continue;
+            }
+            fprintf(stderr, "accept failed: %d\n", error);
             break;
         }
         if (!reserve_client()) {

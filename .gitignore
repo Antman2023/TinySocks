@@ -8,5 +8,8 @@ tinysocks.pdb
 tinysocks-test
 tinysocks-test.exe
 tinysocks-test.pdb
+tinysocks-fault-test
+tinysocks-fault-test.exe
+tinysocks-fault-test.pdb
 tinysocks-mips
 tinysocks-mipsel

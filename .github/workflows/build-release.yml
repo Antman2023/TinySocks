@@ -39,6 +39,9 @@ jobs:
         run: |
           zig cc -std=c11 -O2 -Wall -Wextra -Werror -DMAX_CLIENTS=2 -DIDLE_TIMEOUT_SECONDS=3 -DHANDSHAKE_TIMEOUT_SECONDS=1 tinysocks.c -o ${{ matrix.binary }} ${{ matrix.libs }}
           ${{ matrix.python }} tests/test_proxy.py ./${{ matrix.binary }} -v
+          zig cc -std=c11 -O2 -Wall -Wextra -Werror -DMAX_CLIENTS=2 -DIDLE_TIMEOUT_SECONDS=3 -DHANDSHAKE_TIMEOUT_SECONDS=1 tests/test_faults.c -o fault-${{ matrix.binary }} ${{ matrix.libs }}
+          ./fault-${{ matrix.binary }} --test-internals
+          ${{ matrix.python }} tests/test_proxy.py ./fault-${{ matrix.binary }} ProxyTests.test_domain_connect_and_pipelined_payload ProxyTests.test_udp_domain_and_empty_payload IPv6ProxyTests -v
 
   build:
     needs: test

@@ -474,6 +474,30 @@ class ProxyTests(ProxyTestCase):
                     target.sendto(data, outbound)
                     self.assertEqual(client.recvfrom(65536)[0], header + payload)
 
+    def test_udp_domain_cache_keeps_destination_ports_separate(self):
+        with self.control() as control, \
+             socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client, \
+             socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as first, \
+             socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as second:
+            relay = self.associate(control)
+            client.settimeout(2)
+            for target in [first, second]:
+                target.bind(("127.0.0.1", 0))
+                target.settimeout(2)
+            for host in ["127.0.0.1", "::ffff:127.0.0.1"]:
+                for target in [first, second, first, second]:
+                    with self.subTest(host=host, port=target.getsockname()[1]):
+                        payload = struct.pack("!H", target.getsockname()[1])
+                        request = (b"\x00\x00\x00" +
+                                   encode_address(host, target.getsockname()[1], domain=True) +
+                                   payload)
+                        client.sendto(request, relay)
+                        data, outbound = target.recvfrom(100)
+                        self.assertEqual(data, payload)
+                        target.sendto(data, outbound)
+                        self.assertEqual(client.recvfrom(100)[0], b"\x00\x00\x00" +
+                                         encode_address(*target.getsockname()) + payload)
+
     def test_udp_ipv6_target(self):
         with self.control() as control, \
              socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client, \
