@@ -1,5 +1,6 @@
 """Protocol checks; --release skips checks needing shortened build-time limits."""
 
+import argparse
 import errno
 import random
 import select
@@ -15,13 +16,16 @@ from pathlib import Path
 from threading import Barrier
 
 
-BINARY = Path(sys.argv.pop(1)).resolve()
-FAULTS_ENABLED = "--faults" in sys.argv
-if FAULTS_ENABLED:
-    sys.argv.remove("--faults")
-RELEASE_ENABLED = "--release" in sys.argv
-if RELEASE_ENABLED:
-    sys.argv.remove("--release")
+parser = argparse.ArgumentParser(add_help=False)
+parser.add_argument("binary", type=Path)
+parser.add_argument("--faults", action="store_true")
+parser.add_argument("--release", action="store_true")
+parser.add_argument("--runner", metavar="EXECUTABLE")
+options, sys.argv[1:] = parser.parse_known_args()
+BINARY = options.binary.resolve()
+BINARY_COMMAND = [options.runner, str(BINARY)] if options.runner else [str(BINARY)]
+FAULTS_ENABLED = options.faults
+RELEASE_ENABLED = options.release
 requires_test_limits = unittest.skipIf(RELEASE_ENABLED, "requires shortened test limits")
 GREETING = b"\x05\x01\x00"
 
@@ -70,7 +74,7 @@ class ProxyTestCase(unittest.TestCase):
             except OSError:
                 self.skipTest("IPv6 loopback is unavailable")
         self.proxy = subprocess.Popen(
-            [str(BINARY), *self.proxy_arguments, self.listen_host, "0"],
+            [*BINARY_COMMAND, *self.proxy_arguments, self.listen_host, "0"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
@@ -221,7 +225,7 @@ class CommandLineTests(unittest.TestCase):
     def test_help(self):
         for flag in ["--help", "-h"]:
             with self.subTest(flag=flag):
-                result = subprocess.run([str(BINARY), flag], capture_output=True,
+                result = subprocess.run([*BINARY_COMMAND, flag], capture_output=True,
                                         text=True, timeout=3)
                 self.assertEqual(result.returncode, 0)
                 self.assertIn("Usage:", result.stdout)
@@ -232,19 +236,19 @@ class CommandLineTests(unittest.TestCase):
         for port in ["", "-1", "65536", "65537", "99999999999999999999",
                      "+1080", " 1080", "1080 ", "http", "1.5", "0x438"]:
             with self.subTest(port=port):
-                result = subprocess.run([str(BINARY), "127.0.0.1", port],
+                result = subprocess.run([*BINARY_COMMAND, "127.0.0.1", port],
                                         capture_output=True, text=True, timeout=3)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("Invalid port", result.stderr)
 
     def test_empty_listen_address(self):
-        result = subprocess.run([str(BINARY), "", "0"], capture_output=True,
+        result = subprocess.run([*BINARY_COMMAND, "", "0"], capture_output=True,
                                 text=True, timeout=3)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Invalid listen address", result.stderr)
 
     def test_excess_arguments(self):
-        result = subprocess.run([str(BINARY), "127.0.0.1", "0", "extra"],
+        result = subprocess.run([*BINARY_COMMAND, "127.0.0.1", "0", "extra"],
                                 capture_output=True, text=True, timeout=3)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Usage:", result.stderr)
@@ -1420,7 +1424,7 @@ class WildcardListenerTests(ProxyTestCase):
             existing.bind((bind_host, 0))
             existing.listen()
             result = subprocess.run(
-                [str(BINARY), self.listen_host, str(existing.getsockname()[1])],
+                [*BINARY_COMMAND, self.listen_host, str(existing.getsockname()[1])],
                 capture_output=True, text=True, timeout=3)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("Could not listen", result.stderr)
@@ -1526,8 +1530,8 @@ class WindowsUDPIPv6BindingTests(WindowsUDPBindingTests):
     listen_host = "::1"
 
 
-@unittest.skipUnless(RELEASE_ENABLED and sys.platform == "linux",
-                     "requires the default Linux release and address-space limits")
+@unittest.skipUnless(RELEASE_ENABLED and sys.platform == "linux" and not options.runner,
+                     "requires the native default Linux release and address-space limits")
 class LinuxReleaseResourceTests(ProxyTestCase):
     def test_default_clients_under_address_space_limit(self):
         import resource

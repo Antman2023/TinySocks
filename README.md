@@ -139,6 +139,8 @@ Windows 上默认使用 `python`，其他平台使用 `python3`；可通过 `mak
 
 `make test` 使用与本机发布程序相同的优化和链接参数。`make test-release` 则编译并测试默认运行限制的本机程序；跨平台附件也可用 `python tests/test_proxy.py 程序路径 --release -v` 检查。发布测试保留 TCP/UDP、域名、IPv4/IPv6、背压和半关闭等协议检查，仅跳过依赖短超时或两客户端限制的检查及故障注入专用检查；这些检查仍由 `make test` 和内存检查任务执行。
 
+CI 还通过 [QEMU 用户模式](https://www.qemu.org/docs/master/user/main.html)分别运行实际的 Linux ARM64、ARMv7、大端 MIPS 和小端 MIPSel 发布附件，执行同一套发布协议测试。Linux 主机安装 `qemu-user` 后可使用 `python3 tests/test_proxy.py dist/tinysocks-linux-mips --release --runner qemu-mips -v` 复现；其他架构分别使用 `qemu-aarch64`、`qemu-arm` 和 `qemu-mipsel`。模拟运行时跳过下述本机地址空间限制检查，避免把模拟器自身的内存开销算入代理限制；本机 Linux 检查仍执行。四个模拟测试均通过后才允许发布版本。
+
 Linux 正式附件另在 128 MiB 进程地址空间限制下同时保持默认的 64 个 UDP 会话，确认每个会话可完整转发最大 IPv4 载荷及域名报文，并报告进程的虚拟内存、驻留内存和线程数。该检查只约束代理子进程，不限制测试进程；其他系统及短期限测试程序跳过它。
 
 测试还验证 UDP 域名缓存的不同端口转发、固定过期、容量淘汰和失败重解析；受控解析器确认同一域名的 16 种大小写变体连续发送 100 个数据报只调用一次解析器、只占一项缓存。覆盖尾点、ASCII 编码的国际化域名、下划线、作用域、转义和非 ASCII 输入的缓存边界，并检查原始解析拼写和失败重解析。端到端故障测试先填满解析名额，再验证缓存名称的大小写变体仍能向不同端口转发并接收回复。故障注入程序先模拟连接中断与资源不足，再执行 TCP/UDP 和 IPv6 端到端测试，验证监听服务能够恢复。GitHub Actions 的三个系统均执行这些检查。

@@ -117,9 +117,42 @@ jobs:
           if [ "$RUNNER_OS" != Windows ]; then chmod +x "dist/$binary"; fi
           ${{ matrix.python }} tests/test_proxy.py "dist/$binary" --release -v
 
+  test-release-linux:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: qemu-aarch64
+          - arch: armv7
+            runner: qemu-arm
+          - arch: mips
+            runner: qemu-mips
+          - arch: mipsel
+            runner: qemu-mipsel
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: tinysocks-binaries
+          path: dist
+      - name: Install Linux user-mode emulators
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y qemu-user
+      - name: Verify and test the Linux release binary
+        run: |
+          (cd dist && sha256sum -c SHA256SUMS)
+          binary=dist/tinysocks-linux-${{ matrix.arch }}
+          chmod +x "$binary"
+          ${{ matrix.runner }} --version
+          python3 tests/test_proxy.py "$binary" --release --runner ${{ matrix.runner }} -v
+
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build, test-release]
+    needs: [build, test-release, test-release-linux]
     runs-on: ubuntu-latest
     permissions:
       contents: write
