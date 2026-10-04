@@ -776,6 +776,41 @@ class FaultProxyTests(ProxyTestCase):
             with self.subTest(host=case[0]):
                 ProxyTests.numeric_udp_round_trip(self, *case)
 
+    def test_udp_case_variants_share_cache_with_dns_slots_full(self):
+        with self.control() as control, \
+             socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client, \
+             socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as first, \
+             socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as second:
+            relay = self.associate(control)
+            client.settimeout(0.6)
+            for target in (first, second):
+                target.bind(("127.0.0.1", 0))
+                target.settimeout(0.6)
+
+            def round_trip(host, target):
+                payload = host.encode("ascii") + struct.pack("!H", target.getsockname()[1])
+                client.sendto(b"\x00\x00\x00" + encode_address(
+                    host, target.getsockname()[1], domain=True) + payload, relay)
+                data, outbound = target.recvfrom(100)
+                self.assertEqual(data, payload)
+                target.sendto(data, outbound)
+                self.assertEqual(client.recvfrom(100)[0], b"\x00\x00\x00" +
+                                 encode_address(*target.getsockname()) + payload)
+
+            round_trip("CacheCase.Test", first)
+            # The UDP association uses one client slot, so hold DNS workers
+            # through the remaining slot in sequence. Refresh UDP idle time.
+            for _ in range(2):
+                with self.control() as held:
+                    held.sendall(b"\x05\x01\x00" + encode_address("held.test", 9, domain=True))
+                    self.assertEqual(read_reply(held)[0][:3], b"\x05\x04\x00")
+                    self.assert_closed(held)
+                time.sleep(0.05)
+                round_trip("CacheCase.Test", first)
+            for host, target in (("cachecase.test", second), ("CACHECASE.TEST", first)):
+                with self.subTest(host=host, port=target.getsockname()[1]):
+                    round_trip(host, target)
+
     def test_udp_control_close_during_dns_drops_datagram(self):
         for ignored_data in (b"", b"ignored" * 8192):
             with self.subTest(control_bytes=len(ignored_data)), self.control() as control, \

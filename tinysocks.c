@@ -879,6 +879,22 @@ static int send_udp_request(const unsigned char *payload, size_t length,
     return 1;
 }
 
+static int udp_dns_host_equal(const char *cached, const char *host) {
+    if (!strcmp(cached, host)) return 1;
+    /* RFC 4343 folds ASCII letters in DNS names. Restrict sharing to ordinary
+       DNS spelling: resolver-specific strings (e.g. IPv6 interface scopes)
+       and non-ASCII input retain their original, exact cache identity. */
+    while (*host) {
+        unsigned char a = (unsigned char)*cached++;
+        unsigned char b = (unsigned char)*host++;
+        if (a >= 'A' && a <= 'Z') a = (unsigned char)(a + ('a' - 'A'));
+        if (b >= 'A' && b <= 'Z') b = (unsigned char)(b + ('a' - 'A'));
+        if (a != b || !((b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') ||
+                        b == '-' || b == '_' || b == '.')) return 0;
+    }
+    return *cached == '\0'; /* Keep relative names distinct from names ending in a dot. */
+}
+
 static int forward_udp_request(const unsigned char *packet, size_t length,
                                 socket_t *ipv4, socket_t *ipv6,
                                 struct udp_destination *destinations,
@@ -925,7 +941,7 @@ static int forward_udp_request(const unsigned char *packet, size_t length,
     uint64_t now = monotonic_milliseconds();
     unsigned int slot = 0;
     for (unsigned int i = 0; i < UDP_DNS_CACHE_LIMIT; ++i) {
-        if (dns_cache[i].expires_at_ms > now && !strcmp(dns_cache[i].host, host)) {
+        if (dns_cache[i].expires_at_ms > now && udp_dns_host_equal(dns_cache[i].host, host)) {
             destination = dns_cache[i].address;
             set_address_port(&destination, target_port);
             if (send_udp_request(packet + offset, length - offset, &destination,

@@ -90,6 +90,7 @@ static int injected_pthread_create(pthread_t *, const pthread_attr_t *,
 
 static int fake_dns;
 static unsigned int resolutions;
+static char last_dns_host[256];
 #define TEST_LOOPBACK_IP UINT32_C(0x7f000001)
 /* 1: slow IPv6; 2: all slow; 3: asynchronous refusal; 4: access denied. */
 static int fake_connect;
@@ -217,10 +218,15 @@ static int injected_getaddrinfo(const char *host, const char *port,
         *result = connect_addresses;
         return 0;
     }
+    if (!strcmp(host, "CacheCase.Test") || !strcmp(host, "cachecase.test") ||
+        !strcmp(host, "CACHECASE.TEST"))
+        return getaddrinfo("127.0.0.1", port, hints, result);
     if (!fake_dns) return getaddrinfo(host, port, hints, result);
     ++resolutions;
-    if (!strcmp(host, "missing.test")) return EAI_NONAME;
-    return getaddrinfo(!strcmp(host, "broadcast.test") ? "255.255.255.255" : "127.0.0.1",
+    strcpy(last_dns_host, host);
+    if (!strcmp(host, "missing.test") || !strcmp(host, "MISSING.TEST")) return EAI_NONAME;
+    return getaddrinfo((!strcmp(host, "broadcast.test") || !strcmp(host, "BROADCAST.TEST"))
+                       ? "255.255.255.255" : "127.0.0.1",
                        port, hints, result);
 }
 
@@ -434,12 +440,21 @@ static void test_dns_cache(void) {
 
     assert(domain_request("cached.test", port, &ipv4, &ipv6, destinations, cache));
     uint64_t expiry = cached_entry(cache, "cached.test")->expires_at_ms;
-    for (int i = 1; i < 100; ++i)
-        assert(domain_request("cached.test", port, &ipv4, &ipv6, destinations, cache));
+    for (unsigned int i = 1; i < 100; ++i) {
+        char variant[] = "cached.test";
+        for (unsigned int bit = 0; bit < 4; ++bit)
+            if (i & (1u << bit)) variant[bit] = (char)(variant[bit] - ('a' - 'A'));
+        assert(domain_request(variant, port, &ipv4, &ipv6, destinations, cache));
+    }
     assert(resolutions == 1);
+    assert(!strcmp(last_dns_host, "cached.test"));
     assert(cached_entry(cache, "cached.test")->expires_at_ms == expiry);
+    unsigned int live_entries = 0;
+    for (unsigned int i = 0; i < UDP_DNS_CACHE_LIMIT; ++i)
+        if (cache[i].expires_at_ms) ++live_entries;
+    assert(live_entries == 1);
     /* Ports are applied to cached IPs, not retained from the first request. */
-    assert(domain_request("cached.test", other_port,
+    assert(domain_request("CACHED.TEST", other_port,
                           &ipv4, &ipv6, destinations, cache));
     assert(resolutions == 1);
     assert(address_port(&cache[0].address) == port);
@@ -447,22 +462,25 @@ static void test_dns_cache(void) {
 
     /* Expiry is absolute: repeated packets do not extend cached DNS lifetime. */
     cached_entry(cache, "cached.test")->expires_at_ms = monotonic_milliseconds() - 1;
-    assert(domain_request("cached.test", port, &ipv4, &ipv6, destinations, cache));
+    assert(domain_request("CACHED.TEST", port, &ipv4, &ipv6, destinations, cache));
     assert(resolutions == 2);
+    assert(!strcmp(last_dns_host, "CACHED.TEST"));
 
     /* A failed cached send re-resolves instead of pinning an unusable IP. */
-    ((struct sockaddr_in *)&cached_entry(cache, "cached.test")->address)->sin_addr.s_addr =
+    ((struct sockaddr_in *)&cached_entry(cache, "CACHED.TEST")->address)->sin_addr.s_addr =
         htonl(INADDR_BROADCAST);
     assert(domain_request("cached.test", port, &ipv4, &ipv6, destinations, cache));
     assert(resolutions == 3);
     assert(((struct sockaddr_in *)&cached_entry(cache, "cached.test")->address)->sin_addr.s_addr ==
            local.sin_addr.s_addr);
 
+    const char *missing[] = {"missing.test", "MISSING.TEST"};
     for (int i = 0; i < 2; ++i)
-        assert(!domain_request("missing.test", port, &ipv4, &ipv6, destinations, cache));
+        assert(!domain_request(missing[i], port, &ipv4, &ipv6, destinations, cache));
     assert(resolutions == 5); /* Failed lookups are not cached. */
+    const char *broadcast[] = {"broadcast.test", "BROADCAST.TEST"};
     for (int i = 0; i < 2; ++i)
-        assert(!domain_request("broadcast.test", port, &ipv4, &ipv6, destinations, cache));
+        assert(!domain_request(broadcast[i], port, &ipv4, &ipv6, destinations, cache));
     assert(resolutions == 7); /* Failed sends are not cached either. */
 
     cached_entry(cache, "cached.test")->expires_at_ms = monotonic_milliseconds() + 9000;
@@ -481,6 +499,40 @@ static void test_dns_cache(void) {
     before = resolutions;
     assert(domain_request("127.1", port, &ipv4, &ipv6, destinations, cache));
     assert(resolutions == before + 1); /* Legacy forms still use the system resolver. */
+
+    /* Only ordinary DNS spellings share case variants. Keep resolver-specific
+       syntax, non-ASCII bytes and relative/absolute names distinct. */
+    const struct {
+        const char *first, *second;
+        unsigned int expected_resolutions;
+    } names[] = {
+        {"XN--Cache.Test", "xn--cache.test", 1},
+        {"_Cache._UDP.Test", "_cache._udp.test", 1},
+        {"Case.Test.", "case.test.", 1},
+        {"LocalHost", "localhost", 1},
+        {"Case.Test.", "case.test", 2},
+        {"fe80::1%eth0", "fe80::1%ETH0", 2},
+        {"\\Case.Test", "\\case.test", 2},
+        {"Case-\xc4.Test", "case-\xc4.test", 2},
+        {"\xc4.Test", "\xe4.test", 2},
+        {"Case Test", "case test", 2},
+        {"[Case]", "[case]", 2}
+    };
+    for (unsigned int i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+        memset(cache, 0, sizeof(cache));
+        before = resolutions;
+        assert(domain_request(names[i].first, port, &ipv4, &ipv6, destinations, cache));
+        assert(!strcmp(last_dns_host, names[i].first)); /* Never rewrite resolver input. */
+        expiry = cached_entry(cache, names[i].first)->expires_at_ms;
+        assert(domain_request(names[i].second, other_port,
+                              &ipv4, &ipv6, destinations, cache));
+        assert(resolutions == before + names[i].expected_resolutions);
+        assert(cached_entry(cache, names[i].first)->expires_at_ms == expiry);
+        if (names[i].expected_resolutions == 2)
+            assert(!strcmp(last_dns_host, names[i].second));
+        assert(domain_request(names[i].second, port, &ipv4, &ipv6, destinations, cache));
+        assert(resolutions == before + names[i].expected_resolutions);
+    }
 
     close_socket(target);
     close_socket(second);
@@ -828,7 +880,7 @@ static void test_connection_fallback(void) {
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--test-internals")) {
         test_dns_cache();
-        puts("UDP DNS checks passed (100 literal packets, zero resolutions; cached names, one resolution).");
+        puts("UDP DNS checks passed (100 literals, zero resolutions; 100 case variants, one resolution; syntax, TTL, ports, failures).");
         test_connection_fallback();
         test_resolver_deadline_and_limit();
         test_resolver_control_close();
