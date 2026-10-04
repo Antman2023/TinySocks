@@ -1,5 +1,6 @@
 """Protocol checks; --release skips checks needing shortened build-time limits."""
 
+import errno
 import random
 import select
 import socket
@@ -1218,6 +1219,69 @@ class IPv6ProxyTests(ProxyTestCase):
             self.assertEqual(data, b"ipv6 client")
             target.sendto(data, outbound)
             self.assertEqual(client.recvfrom(100)[0], request)
+
+
+class WildcardListenerTests(ProxyTestCase):
+    listen_host = "0.0.0.0"
+    client_host = "127.0.0.1"
+    family = socket.AF_INET
+
+    def test_listener_cannot_be_shadowed(self):
+        for host in (self.listen_host, self.client_host):
+            for reuse in (False, True):
+                with self.subTest(host=host, reuse=reuse), socket.socket(self.family) as contender:
+                    if reuse:
+                        contender.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    # Unix may allow bind with REUSEADDR, but must reject listen.
+                    with self.assertRaises(OSError) as rejected:
+                        contender.bind((host, self.port))
+                        contender.listen()
+                    self.assertIn(rejected.exception.errno,
+                                  (errno.EADDRINUSE, errno.EACCES, 10048, 10013))
+
+        # Failed competing binds must leave actual proxy traffic working.
+        with socket.socket(self.family) as listener:
+            listener.bind((self.client_host, 0))
+            listener.listen()
+            listener.settimeout(2)
+            with socket.create_connection((self.client_host, self.port), 2) as control:
+                control.settimeout(2)
+                control.sendall(GREETING + b"\x05\x01\x00" +
+                                encode_address(self.client_host, listener.getsockname()[1]) +
+                                b"exclusive request")
+                control.shutdown(socket.SHUT_WR)
+                self.assertEqual(recv_exact(control, 2), b"\x05\x00")
+                self.assertEqual(read_reply(control)[0][:3], b"\x05\x00\x00")
+                with listener.accept()[0] as target:
+                    target.settimeout(2)
+                    self.assertEqual(recv_exact(target, 17), b"exclusive request")
+                    self.assertEqual(target.recv(1), b"")
+                    target.sendall(b"exclusive reply")
+                    target.shutdown(socket.SHUT_WR)
+                    self.assertEqual(recv_exact(control, 15), b"exclusive reply")
+                    self.assertEqual(control.recv(1), b"")
+
+    def test_existing_listener_prevents_wildcard_startup(self):
+        with socket.socket(self.family) as existing:
+            existing.bind((self.client_host, 0))
+            existing.listen()
+            result = subprocess.run(
+                [str(BINARY), self.listen_host, str(existing.getsockname()[1])],
+                capture_output=True, text=True, timeout=3)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Could not listen", result.stderr)
+            self.assertNotIn("SOCKS5 listening on", result.stderr)
+            # The failed proxy must leave the first listener intact.
+            existing.settimeout(2)
+            with socket.create_connection((self.client_host, existing.getsockname()[1]), 2):
+                with existing.accept()[0] as accepted:
+                    self.assertEqual(accepted.getsockname()[1], existing.getsockname()[1])
+
+
+class WildcardIPv6ListenerTests(WildcardListenerTests):
+    listen_host = "::"
+    client_host = "::1"
+    family = socket.AF_INET6
 
 
 if __name__ == "__main__":

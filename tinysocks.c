@@ -1390,7 +1390,15 @@ int main(int argc, char **argv) {
     for (struct addrinfo *address = addresses; address; address = address->ai_next) {
         socket_t fd = socket(address->ai_family, address->ai_socktype, address->ai_protocol);
         if (fd == INVALID_FD) continue;
-#ifndef _WIN32
+#ifdef _WIN32
+        /* A wildcard listener must not be shadowed by another local bind. */
+        int exclusive = 1;
+        if (setsockopt(fd, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+                       (const char *)&exclusive, sizeof(exclusive)) != 0) {
+            close_socket(fd);
+            continue;
+        }
+#else
         int reuse = 1;
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 #endif

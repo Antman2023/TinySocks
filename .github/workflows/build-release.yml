@@ -53,7 +53,7 @@ jobs:
             ProxyTests.test_tcp_client_reset_under_backpressure_releases_slot \
             ProxyTests.test_tcp_target_reset_under_backpressure_releases_slot \
             ProxyTests.test_tcp_half_close_under_backpressure \
-            IPv6ProxyTests -v
+            IPv6ProxyTests WildcardListenerTests WildcardIPv6ListenerTests -v
 
   build:
     needs: [test, test-memory]
