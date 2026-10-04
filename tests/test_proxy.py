@@ -12,6 +12,9 @@ from pathlib import Path
 
 
 BINARY = Path(sys.argv.pop(1)).resolve()
+FAULTS_ENABLED = "--faults" in sys.argv
+if FAULTS_ENABLED:
+    sys.argv.remove("--faults")
 GREETING = b"\x05\x01\x00"
 
 
@@ -671,6 +674,63 @@ class ProxyTests(ProxyTestCase):
                     self.assertEqual(target.recv(1), b"")
                     target.sendall(b"tail")
                     self.assertEqual(recv_exact(control, 4), b"tail")
+
+
+@unittest.skipUnless(FAULTS_ENABLED, "requires the fault-injection binary (--faults)")
+class FaultProxyTests(ProxyTestCase):
+    """Checks requiring the resolver and socket failures in test_faults.c."""
+
+    def test_slow_dns_respects_connection_deadline(self):
+        with socket.socket() as listener, self.control() as control:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            control.settimeout(1.5)
+            start = time.monotonic()
+            control.sendall(b"\x05\x01\x00" +
+                            encode_address("slow.test", listener.getsockname()[1], domain=True))
+            header, _ = read_reply(control)
+            self.assertEqual(header[:3], b"\x05\x04\x00")
+            self.assertLess(time.monotonic() - start, 1.5)
+            self.assert_closed(control)
+            listener.settimeout(0.1)
+            with self.assertRaises(socket.timeout):
+                listener.accept()
+
+    def test_slow_udp_dns_does_not_pin_client(self):
+        with self.control() as control, \
+             socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as rogue, \
+             socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client, \
+             socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as target:
+            relay = self.associate(control)
+            rogue.bind(("127.0.0.1", 0))
+            client.bind(("127.0.0.1", 0))
+            target.bind(("127.0.0.1", 0))
+            target.settimeout(1.5)
+            client.settimeout(2)
+            rogue.sendto(b"\x00\x00\x00" +
+                         encode_address("slow.test", target.getsockname()[1], domain=True) +
+                         b"slow", relay)
+            time.sleep(0.1)
+            request = b"\x00\x00\x00" + encode_address(*target.getsockname()) + b"valid"
+            client.sendto(request, relay)
+            data, outbound = target.recvfrom(100)
+            self.assertEqual(data, b"valid")
+            target.sendto(data, outbound)
+            self.assertEqual(client.recvfrom(100)[0], request)
+            # A late resolver result must never deliver the timed-out datagram.
+            target.settimeout(1.2)
+            with self.assertRaises(socket.timeout):
+                target.recvfrom(100)
+
+    def test_udp_dns_wait_respects_remaining_idle_budget(self):
+        with self.control() as control, \
+             socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
+            relay = self.associate(control)
+            time.sleep(2.5)
+            control.settimeout(0.8)
+            client.sendto(b"\x00\x00\x00" + encode_address("slow.test", 12345, domain=True),
+                          relay)
+            self.assert_closed(control)
 
 
 class IPv6ProxyTests(ProxyTestCase):

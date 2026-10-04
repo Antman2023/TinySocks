@@ -1,6 +1,7 @@
 /* Deterministic resolver, connection and accept failures without external services. */
 #define _POSIX_C_SOURCE 200112L
 #define CONNECT_TIMEOUT_SECONDS 1
+#define MAX_RESOLVERS 2
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
@@ -9,28 +10,37 @@
 #else
 #include <netdb.h>
 #include <poll.h>
+#include <pthread.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
 /* Zig's optimized builds define NDEBUG; checks must still execute. */
 #undef NDEBUG
 #include <assert.h>
+#include <stdlib.h>
 
 static int injected_getaddrinfo(const char *, const char *, const struct addrinfo *,
                                 struct addrinfo **);
 static void injected_freeaddrinfo(struct addrinfo *);
+static void *injected_calloc(size_t, size_t);
 #ifdef _WIN32
 static SOCKET injected_accept(SOCKET, struct sockaddr *, int *);
 static int injected_connect(SOCKET, const struct sockaddr *, int);
 static int injected_close(SOCKET);
 static int injected_getsockopt(SOCKET, int, int, char *, int *);
 static int injected_select(int, fd_set *, fd_set *, fd_set *, const struct timeval *);
+static HANDLE injected_create_event(LPSECURITY_ATTRIBUTES, BOOL, BOOL, LPCSTR);
+static HANDLE injected_create_thread(LPSECURITY_ATTRIBUTES, SIZE_T, LPTHREAD_START_ROUTINE,
+                                      LPVOID, DWORD, LPDWORD);
 #else
 static int injected_accept(int, struct sockaddr *, socklen_t *);
 static int injected_connect(int, const struct sockaddr *, socklen_t);
 static int injected_close(int);
 static int injected_getsockopt(int, int, int, void *, socklen_t *);
 static int injected_poll(struct pollfd *, nfds_t, int);
+static int injected_pipe(int *);
+static int injected_pthread_create(pthread_t *, const pthread_attr_t *,
+                                    void *(*)(void *), void *);
 #endif
 
 #define getaddrinfo injected_getaddrinfo
@@ -38,12 +48,18 @@ static int injected_poll(struct pollfd *, nfds_t, int);
 #define accept injected_accept
 #define connect injected_connect
 #define getsockopt injected_getsockopt
+#define calloc injected_calloc
 #ifdef _WIN32
+#undef CreateEvent
+#define CreateEvent injected_create_event
+#define CreateThread injected_create_thread
 #define closesocket injected_close
 #define select injected_select
 #else
 #define close injected_close
 #define poll injected_poll
+#define pipe injected_pipe
+#define pthread_create injected_pthread_create
 #endif
 #define main tinysocks_main
 #include "../tinysocks.c"
@@ -53,12 +69,17 @@ static int injected_poll(struct pollfd *, nfds_t, int);
 #undef freeaddrinfo
 #undef connect
 #undef getsockopt
+#undef calloc
 #ifdef _WIN32
+#undef CreateEvent
+#undef CreateThread
 #undef closesocket
 #undef select
 #else
 #undef close
 #undef poll
+#undef pipe
+#undef pthread_create
 #endif
 
 static int fake_dns;
@@ -71,6 +92,57 @@ static struct sockaddr_storage connect_endpoints[3];
 static socket_t slow_sockets[CONNECT_PENDING_LIMIT];
 static unsigned int slow_count, slow_closed, connect_calls, connect_waits;
 static int connect_families[CONNECT_PENDING_LIMIT];
+static atomic_int release_held_dns = ATOMIC_VAR_INIT(0);
+static atomic_uint held_dns_calls = ATOMIC_VAR_INIT(0);
+static atomic_uint held_dns_freed = ATOMIC_VAR_INIT(0);
+static _Atomic(struct addrinfo *) held_results[MAX_RESOLVERS];
+static int resolver_setup_failure;
+#ifdef _WIN32
+static HANDLE failed_resolver_event;
+#else
+static int failed_resolver_pipe[2];
+#endif
+
+static void *injected_calloc(size_t count, size_t size) {
+    if (resolver_setup_failure == 1) return NULL;
+    return calloc(count, size);
+}
+
+#ifdef _WIN32
+static HANDLE injected_create_event(LPSECURITY_ATTRIBUTES attributes, BOOL manual_reset,
+                                     BOOL initial_state, LPCSTR name) {
+    if (resolver_setup_failure == 2) return NULL;
+    HANDLE event = CreateEventA(attributes, manual_reset, initial_state, name);
+    if (resolver_setup_failure == 3) failed_resolver_event = event;
+    return event;
+}
+
+static HANDLE injected_create_thread(LPSECURITY_ATTRIBUTES attributes, SIZE_T stack_size,
+                                      LPTHREAD_START_ROUTINE start, LPVOID argument,
+                                      DWORD flags, LPDWORD thread_id) {
+    if (resolver_setup_failure == 3 && start == resolver_thread) return NULL;
+    return CreateThread(attributes, stack_size, start, argument, flags, thread_id);
+}
+#else
+static int injected_pipe(int *fds) {
+    if (resolver_setup_failure == 2) {
+        errno = EMFILE;
+        return -1;
+    }
+    int result = pipe(fds);
+    if (!result && resolver_setup_failure == 3) {
+        failed_resolver_pipe[0] = fds[0];
+        failed_resolver_pipe[1] = fds[1];
+    }
+    return result;
+}
+
+static int injected_pthread_create(pthread_t *thread, const pthread_attr_t *attributes,
+                                    void *(*start)(void *), void *argument) {
+    if (resolver_setup_failure == 3 && start == resolver_thread) return EAGAIN;
+    return pthread_create(thread, attributes, start, argument);
+}
+#endif
 
 static void set_test_error(int error) {
 #ifdef _WIN32
@@ -87,12 +159,35 @@ static int slow_socket(socket_t fd) {
 }
 
 static void injected_freeaddrinfo(struct addrinfo *addresses) {
+    for (unsigned int i = 0; i < MAX_RESOLVERS; ++i)
+        if (atomic_load_explicit(&held_results[i], memory_order_acquire) == addresses) {
+            atomic_fetch_add_explicit(&held_dns_freed, 1, memory_order_relaxed);
+            atomic_store_explicit(&held_results[i], NULL, memory_order_relaxed);
+        }
     if (addresses != connect_addresses) freeaddrinfo(addresses);
 }
 
 static int injected_getaddrinfo(const char *host, const char *port,
                                 const struct addrinfo *hints, struct addrinfo **result) {
+    if (!strcmp(host, "held.test")) {
+        unsigned int slot = atomic_fetch_add_explicit(&held_dns_calls, 1, memory_order_relaxed);
+        assert(slot < MAX_RESOLVERS);
+        while (!atomic_load_explicit(&release_held_dns, memory_order_acquire)) retry_pause(1);
+        int error = getaddrinfo("127.0.0.1", port, hints, result);
+        assert(error == 0);
+        atomic_store_explicit(&held_results[slot], *result, memory_order_release);
+        return error;
+    }
+    if (!strcmp(host, "slow.test")) {
+        retry_pause(2000);
+        return getaddrinfo("127.0.0.1", port, hints, result);
+    }
     if (fake_connect && !strcmp(host, "fallback.test")) {
+        *result = connect_addresses;
+        return 0;
+    }
+    if (fake_connect && !strcmp(host, "slow-fallback.test")) {
+        retry_pause(600);
         *result = connect_addresses;
         return 0;
     }
@@ -235,7 +330,8 @@ static int domain_request(const char *host, unsigned short port, socket_t *ipv4,
     memcpy(packet + 5, host, length);
     packet[5 + length] = (unsigned char)(port >> 8);
     packet[6 + length] = (unsigned char)port;
-    return forward_udp_request(packet, length + 7, ipv4, ipv6, destinations, cache);
+    return forward_udp_request(packet, length + 7, ipv4, ipv6, destinations, cache,
+                                monotonic_milliseconds() + CONNECT_TIMEOUT_SECONDS * 1000);
 }
 
 static struct udp_dns_entry *cached_entry(struct udp_dns_entry *cache, const char *host) {
@@ -333,6 +429,99 @@ static void reset_connect_test(int mode) {
     slow_count = slow_closed = connect_calls = connect_waits = 0;
 }
 
+static void wait_for_resolvers(void) {
+    uint64_t deadline_ms = monotonic_milliseconds() + 1000;
+    while (atomic_load_explicit(&active_resolvers, memory_order_acquire)) {
+        assert(remaining_milliseconds(deadline_ms));
+        retry_pause(1);
+    }
+}
+
+#ifdef _WIN32
+static DWORD WINAPI release_dns_thread(LPVOID argument) {
+#else
+static void *release_dns_thread(void *argument) {
+#endif
+    (void)argument;
+    retry_pause(50);
+    atomic_store_explicit(&release_held_dns, 1, memory_order_release);
+#ifdef _WIN32
+    return 0;
+#else
+    return NULL;
+#endif
+}
+
+static void test_resolver_deadline_and_limit(void) {
+#ifdef _WIN32
+    WSADATA winsock;
+    assert(WSAStartup(MAKEWORD(2, 2), &winsock) == 0);
+#endif
+    wait_for_resolvers();
+    struct addrinfo hints = {0}, *addresses = NULL;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_NUMERICSERV;
+    for (unsigned int i = 0; i < MAX_RESOLVERS; ++i) {
+        assert(resolve_target("held.test", "80", &hints, &addresses,
+                              monotonic_milliseconds() + 50) == EAI_AGAIN);
+        assert(addresses == NULL);
+    }
+    assert(atomic_load_explicit(&active_resolvers, memory_order_acquire) == MAX_RESOLVERS);
+    uint64_t start = monotonic_milliseconds();
+    assert(resolve_target("held.test", "80", &hints, &addresses, start + 50) == EAI_AGAIN);
+    assert(monotonic_milliseconds() - start >= 40 && monotonic_milliseconds() - start < 250);
+#ifdef _WIN32
+    HANDLE releaser = CreateThread(NULL, 0, release_dns_thread, NULL, 0, NULL);
+    assert(releaser != NULL);
+#else
+    pthread_t releaser;
+    assert(pthread_create(&releaser, NULL, release_dns_thread, NULL) == 0);
+#endif
+    /* A caller queued at capacity succeeds when earlier timed-out jobs finish. */
+    start = monotonic_milliseconds();
+    assert(resolve_target("127.0.0.1", "80", &hints, &addresses,
+                          start + 1000) == 0);
+    assert(monotonic_milliseconds() - start >= 40);
+    assert(addresses != NULL);
+    freeaddrinfo(addresses);
+    wait_for_resolvers();
+    assert(atomic_load_explicit(&held_dns_calls, memory_order_relaxed) == MAX_RESOLVERS);
+    assert(atomic_load_explicit(&held_dns_freed, memory_order_relaxed) == MAX_RESOLVERS);
+    for (int failure = 1; failure <= 3; ++failure) {
+        resolver_setup_failure = failure;
+        int error = resolve_target("127.0.0.1", "80", &hints, &addresses,
+                                    monotonic_milliseconds() + 1000);
+        assert(error == (failure == 1 ? EAI_MEMORY : EAI_AGAIN));
+        assert(addresses == NULL);
+        assert(atomic_load_explicit(&active_resolvers, memory_order_acquire) == 0);
+        if (failure == 3) {
+#ifdef _WIN32
+            assert(failed_resolver_event != NULL);
+            assert(WaitForSingleObject(failed_resolver_event, 0) == WAIT_FAILED);
+#else
+            for (int i = 0; i < 2; ++i) {
+                assert(fcntl(failed_resolver_pipe[i], F_GETFD) == -1);
+                assert(errno == EBADF);
+            }
+#endif
+        }
+        resolver_setup_failure = 0;
+        assert(resolve_target("127.0.0.1", "80", &hints, &addresses,
+                              monotonic_milliseconds() + 1000) == 0);
+        freeaddrinfo(addresses);
+        wait_for_resolvers();
+    }
+#ifdef _WIN32
+    assert(WaitForSingleObject(releaser, 1000) == WAIT_OBJECT_0);
+    CloseHandle(releaser);
+    WSACleanup();
+#else
+    assert(pthread_join(releaser, NULL) == 0);
+#endif
+    puts("Resolver checks passed (deadlines, job limit, queuing, cleanup, setup failures, recovery).");
+}
+
 static void test_connection_fallback(void) {
 #ifdef _WIN32
     WSADATA winsock;
@@ -404,6 +593,13 @@ static void test_connection_fallback(void) {
     assert(slow_closed == slow_count && slow_count == 3);
     assert(connect_waits < 20); /* Sleeping candidates must not cause a busy loop. */
 
+    reset_connect_test(2);
+    start = monotonic_milliseconds();
+    assert(connect_target("slow-fallback.test", port, NULL, &status) == INVALID_FD);
+    elapsed = monotonic_milliseconds() - start;
+    assert(status == 4 && elapsed >= 900 && elapsed < 1500);
+    assert(connect_calls > 0 && connect_calls < 3 && slow_closed == slow_count);
+
     reset_connect_test(3);
     assert(connect_target("fallback.test", port, NULL, &status) == INVALID_FD);
     assert(status == 5 && connect_calls == 3 && slow_closed == 3);
@@ -427,6 +623,7 @@ int main(int argc, char **argv) {
         test_dns_cache();
         puts("UDP DNS cache checks passed (100 packets, one resolution).");
         test_connection_fallback();
+        test_resolver_deadline_and_limit();
         return 0;
     }
     return tinysocks_main(argc, argv);

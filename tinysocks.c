@@ -49,11 +49,15 @@ typedef int socket_t;
 #ifndef MAX_CLIENTS
 #define MAX_CLIENTS 64
 #endif
+#ifndef MAX_RESOLVERS
+#define MAX_RESOLVERS 8
+#endif
 #ifndef IDLE_TIMEOUT_SECONDS
 #define IDLE_TIMEOUT_SECONDS 300
 #endif
 
-_Static_assert(MAX_CLIENTS > 0, "MAX_CLIENTS must be positive");
+_Static_assert(MAX_CLIENTS > 0 && MAX_CLIENTS <= UINT_MAX, "MAX_CLIENTS is out of range");
+_Static_assert(MAX_RESOLVERS > 0 && MAX_RESOLVERS <= UINT_MAX, "MAX_RESOLVERS is out of range");
 _Static_assert(HANDSHAKE_TIMEOUT_SECONDS > 0 && HANDSHAKE_TIMEOUT_SECONDS <= INT_MAX / 1000,
                "HANDSHAKE_TIMEOUT_SECONDS is out of range");
 _Static_assert(CONNECT_TIMEOUT_SECONDS > 0 && CONNECT_TIMEOUT_SECONDS <= INT_MAX / 1000,
@@ -68,15 +72,20 @@ typedef struct pollfd pollfd_t;
 #endif
 
 static atomic_uint active_clients = ATOMIC_VAR_INIT(0);
+static atomic_uint active_resolvers = ATOMIC_VAR_INIT(0);
 
-static int reserve_client(void) {
-    unsigned int count = atomic_load_explicit(&active_clients, memory_order_relaxed);
-    while (count < MAX_CLIENTS) {
-        if (atomic_compare_exchange_weak_explicit(&active_clients, &count, count + 1,
+static int reserve_slot(atomic_uint *counter, unsigned int limit) {
+    unsigned int count = atomic_load_explicit(counter, memory_order_relaxed);
+    while (count < limit) {
+        if (atomic_compare_exchange_weak_explicit(counter, &count, count + 1,
                                                   memory_order_relaxed, memory_order_relaxed))
             return 1;
     }
     return 0;
+}
+
+static int reserve_client(void) {
+    return reserve_slot(&active_clients, MAX_CLIENTS);
 }
 
 static int poll_sockets(pollfd_t *fds, unsigned int count, int timeout_ms) {
@@ -203,6 +212,127 @@ static int wait_for_io(socket_t fd, short events, uint64_t deadline_ms) {
     }
 }
 
+struct resolver_job {
+    char host[256], port[6];
+    struct addrinfo hints, *addresses;
+    int error;
+    uint64_t completed_at_ms;
+    atomic_uint references;
+    atomic_int completed;
+#ifdef _WIN32
+    HANDLE ready;
+#else
+    int ready[2];
+#endif
+};
+
+static void release_resolver_job(struct resolver_job *job) {
+    if (atomic_fetch_sub_explicit(&job->references, 1, memory_order_acq_rel) != 1) return;
+    if (job->addresses) freeaddrinfo(job->addresses);
+#ifdef _WIN32
+    if (job->ready) CloseHandle(job->ready);
+#else
+    if (job->ready[0] >= 0) close(job->ready[0]);
+    if (job->ready[1] >= 0) close(job->ready[1]);
+#endif
+    free(job);
+}
+
+#ifdef _WIN32
+static DWORD WINAPI resolver_thread(LPVOID argument) {
+#else
+static void *resolver_thread(void *argument) {
+#endif
+    struct resolver_job *job = argument;
+    job->error = getaddrinfo(job->host, job->port, &job->hints, &job->addresses);
+    job->completed_at_ms = monotonic_milliseconds();
+    atomic_store_explicit(&job->completed, 1, memory_order_release);
+#ifdef _WIN32
+    SetEvent(job->ready);
+#else
+    /* The worker retains both pipe ends, even if its caller has timed out. */
+    char notification = 0;
+    while (write(job->ready[1], &notification, 1) < 0 && errno == EINTR) {}
+#endif
+    release_resolver_job(job);
+    /* Timed-out callers cannot open more jobs while their resolver still runs. */
+    atomic_fetch_sub_explicit(&active_resolvers, 1, memory_order_release);
+#ifdef _WIN32
+    return 0;
+#else
+    return NULL;
+#endif
+}
+
+static int resolve_target(const char *host, const char *port, const struct addrinfo *hints,
+                           struct addrinfo **addresses, uint64_t deadline_ms) {
+    *addresses = NULL;
+    if (strlen(host) >= 256 || strlen(port) >= 6) return EAI_NONAME;
+    /* Queue callers within their existing budget instead of rejecting DNS bursts. */
+    for (;;) {
+        int remaining_ms = remaining_milliseconds(deadline_ms);
+        if (!remaining_ms) return EAI_AGAIN;
+        if (reserve_slot(&active_resolvers, MAX_RESOLVERS)) break;
+        retry_pause(remaining_ms < 5 ? remaining_ms : 5);
+    }
+    struct resolver_job *job = calloc(1, sizeof(*job));
+    if (!job) {
+        atomic_fetch_sub_explicit(&active_resolvers, 1, memory_order_relaxed);
+        return EAI_MEMORY;
+    }
+    atomic_init(&job->references, 1);
+    atomic_init(&job->completed, 0);
+    strcpy(job->host, host);
+    strcpy(job->port, port);
+    job->hints = *hints;
+#ifdef _WIN32
+    job->ready = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (!job->ready) goto failed;
+    atomic_store_explicit(&job->references, 2, memory_order_relaxed);
+    HANDLE thread = CreateThread(NULL, 0, resolver_thread, job, 0, NULL);
+    if (!thread) {
+        atomic_store_explicit(&job->references, 1, memory_order_relaxed);
+        goto failed;
+    }
+    CloseHandle(thread);
+    WaitForSingleObject(job->ready, (DWORD)remaining_milliseconds(deadline_ms));
+#else
+    job->ready[0] = job->ready[1] = -1;
+    if (pipe(job->ready) != 0 ||
+        fcntl(job->ready[0], F_SETFD, FD_CLOEXEC) != 0 ||
+        fcntl(job->ready[1], F_SETFD, FD_CLOEXEC) != 0) goto failed;
+    pthread_attr_t attributes;
+    if (pthread_attr_init(&attributes) != 0) goto failed;
+    int error = pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
+    pthread_t thread;
+    if (!error) {
+        atomic_store_explicit(&job->references, 2, memory_order_relaxed);
+        error = pthread_create(&thread, &attributes, resolver_thread, job);
+    }
+    pthread_attr_destroy(&attributes);
+    if (error) {
+        atomic_store_explicit(&job->references, 1, memory_order_relaxed);
+        goto failed;
+    }
+    wait_for_io(job->ready[0], POLLIN, deadline_ms);
+#endif
+    int result = EAI_AGAIN;
+    if (atomic_load_explicit(&job->completed, memory_order_acquire) &&
+        job->completed_at_ms <= deadline_ms) {
+        result = job->error;
+        if (!result) {
+            *addresses = job->addresses;
+            job->addresses = NULL;
+        }
+    }
+    release_resolver_job(job);
+    return result;
+failed:
+    release_resolver_job(job);
+    atomic_fetch_sub_explicit(&active_resolvers, 1, memory_order_relaxed);
+    return EAI_AGAIN;
+}
+
 static int send_all(socket_t fd, const unsigned char *data, size_t length,
                     uint64_t deadline_ms) {
     while (length != 0) {
@@ -308,6 +438,8 @@ static socket_t connect_target(const char *host, const char *port,
     struct addrinfo numeric_address = {0};
     struct sockaddr_storage numeric_endpoint;
     socket_t result = INVALID_FD;
+    /* Resolution and all connection attempts share this deadline. */
+    uint64_t deadline_ms = monotonic_milliseconds() + CONNECT_TIMEOUT_SECONDS * 1000;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -319,14 +451,13 @@ static socket_t connect_target(const char *host, const char *port,
         numeric_address.ai_addr = (struct sockaddr *)&numeric_endpoint;
         numeric_address.ai_addrlen = address_length(&numeric_endpoint);
         addresses = &numeric_address;
-    } else if (getaddrinfo(host, port, &hints, &addresses) != 0) {
+    } else if (resolve_target(host, port, &hints, &addresses, deadline_ms) != 0) {
         *status = 4; /* Host unreachable. */
         return INVALID_FD;
     }
 
     *status = 1; /* General failure. */
     /* Stagger candidates within one budget, bounding sockets for small devices. */
-    uint64_t deadline_ms = monotonic_milliseconds() + CONNECT_TIMEOUT_SECONDS * 1000;
     uint64_t next_start_ms = monotonic_milliseconds();
     struct addrinfo *cursors[2] = {addresses, addresses};
     int family_index = 0;
@@ -639,12 +770,13 @@ static int send_udp_request(const unsigned char *payload, size_t length,
 static int forward_udp_request(const unsigned char *packet, size_t length,
                                 socket_t *ipv4, socket_t *ipv6,
                                 struct udp_destination *destinations,
-                                struct udp_dns_entry *dns_cache) {
+                                struct udp_dns_entry *dns_cache, uint64_t deadline_ms) {
     char host[256], port[6];
     struct sockaddr_storage destination;
     memset(&destination, 0, sizeof(destination));
     size_t offset = 4, address_size;
-    if (length < 4 || packet[0] != 0 || packet[1] != 0 || packet[2] != 0)
+    if (!remaining_milliseconds(deadline_ms) ||
+        length < 4 || packet[0] != 0 || packet[1] != 0 || packet[2] != 0)
         return 0; /* Fragmented UDP datagrams are not supported. */
     if (packet[3] == 1 || packet[3] == 4) {
         int family = packet[3] == 1 ? AF_INET : AF_INET6;
@@ -697,9 +829,12 @@ static int forward_udp_request(const unsigned char *packet, size_t length,
     hints.ai_socktype = SOCK_DGRAM;
     hints.ai_protocol = IPPROTO_UDP;
     hints.ai_flags = AI_NUMERICSERV;
-    if (getaddrinfo(host, port, &hints, &addresses) != 0) return 0;
+    uint64_t dns_deadline_ms = monotonic_milliseconds() + CONNECT_TIMEOUT_SECONDS * 1000;
+    if (deadline_ms < dns_deadline_ms) dns_deadline_ms = deadline_ms;
+    if (resolve_target(host, port, &hints, &addresses, dns_deadline_ms) != 0) return 0;
     int forwarded = 0;
     for (struct addrinfo *address = addresses; address; address = address->ai_next) {
+        if (!remaining_milliseconds(deadline_ms)) break;
         if (address->ai_family != AF_INET && address->ai_family != AF_INET6) continue;
         if ((size_t)address->ai_addrlen > sizeof(destination)) continue;
         memset(&destination, 0, sizeof(destination));
@@ -820,7 +955,7 @@ static void udp_associate(socket_t client, unsigned short requested_port) {
                     (!requested_port || address_port(&source) == requested_port) &&
                     (!client_known || address_port(&source) == address_port(&udp_client))) {
                     if (forward_udp_request(packet, (size_t)count, &ipv4, &ipv6,
-                                            destinations, dns_cache)) {
+                                            destinations, dns_cache, deadline_ms)) {
                         udp_client = source;
                         client_known = 1;
                         deadline_ms = monotonic_milliseconds() + IDLE_TIMEOUT_SECONDS * 1000;

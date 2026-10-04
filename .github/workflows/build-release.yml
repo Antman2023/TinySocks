@@ -41,10 +41,23 @@ jobs:
           ${{ matrix.python }} tests/test_proxy.py ./${{ matrix.binary }} -v
           zig cc -std=c11 -O2 -Wall -Wextra -Werror -DMAX_CLIENTS=2 -DIDLE_TIMEOUT_SECONDS=3 -DHANDSHAKE_TIMEOUT_SECONDS=1 tests/test_faults.c -o fault-${{ matrix.binary }} ${{ matrix.libs }}
           ./fault-${{ matrix.binary }} --test-internals
-          ${{ matrix.python }} tests/test_proxy.py ./fault-${{ matrix.binary }} ProxyTests.test_domain_connect_and_pipelined_payload ProxyTests.test_udp_domain_and_empty_payload IPv6ProxyTests -v
+          ${{ matrix.python }} tests/test_proxy.py ./fault-${{ matrix.binary }} --faults FaultProxyTests ProxyTests.test_domain_connect_and_pipelined_payload ProxyTests.test_udp_domain_and_empty_payload IPv6ProxyTests -v
+
+  test-memory:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check resolver lifetimes and protocol behavior with sanitizers
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          clang -std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer -DMAX_CLIENTS=2 -DIDLE_TIMEOUT_SECONDS=3 -DHANDSHAKE_TIMEOUT_SECONDS=1 tests/test_faults.c -o fault-sanitized -pthread
+          ./fault-sanitized --test-internals
+          python3 tests/test_proxy.py ./fault-sanitized --faults FaultProxyTests ProxyTests.test_domain_connect_and_pipelined_payload ProxyTests.test_udp_domain_and_empty_payload IPv6ProxyTests -v
 
   build:
-    needs: test
+    needs: [test, test-memory]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
