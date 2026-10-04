@@ -16,6 +16,7 @@ typedef SOCKET socket_t;
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -217,13 +218,41 @@ static int wait_for_io(socket_t fd, short events, uint64_t deadline_ms) {
 static int udp_control_open(socket_t client, uint64_t deadline_ms) {
     if (client == INVALID_FD) return 1;
     char ignored[1024];
+    size_t pending = sizeof(ignored);
+    int snapshotted = 0;
     while (remaining_milliseconds(deadline_ms)) {
-        int count = recv(client, ignored, sizeof(ignored), 0);
+        int peek = snapshotted && pending == 0;
+        size_t length = peek ? 1 : pending < sizeof(ignored) ? pending : sizeof(ignored);
+        int count = recv(client, ignored, (int)length, peek ? MSG_PEEK : 0);
         if (count == 0) return 0;
         if (count < 0) {
             int error = socket_error();
             if (interrupted(error)) continue;
             return would_block(error);
+        }
+        if (peek) return 1; /* New bytes can wait; EOF and errors above end the association. */
+        if (snapshotted) {
+            pending -= (size_t)count;
+            continue;
+        }
+        /* Drain the bytes already available, then yield even if new data arrives.
+           Empty control sockets still need only the first nonblocking recv. */
+        for (;;) {
+            if (!remaining_milliseconds(deadline_ms)) return 0;
+#ifdef _WIN32
+            u_long queued = 0;
+            int result = ioctlsocket(client, FIONREAD, &queued);
+#else
+            int queued = 0;
+            int result = ioctl(client, FIONREAD, &queued);
+            if (!result && queued < 0) return 0;
+#endif
+            if (!result) {
+                pending = (size_t)queued;
+                snapshotted = 1;
+                break;
+            }
+            if (!interrupted(socket_error())) return 0;
         }
     }
     return 0;

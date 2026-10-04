@@ -11,6 +11,7 @@
 #include <netdb.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
@@ -28,6 +29,8 @@ static SOCKET injected_accept(SOCKET, struct sockaddr *, int *);
 static int injected_connect(SOCKET, const struct sockaddr *, int);
 static int injected_close(SOCKET);
 static int injected_getsockopt(SOCKET, int, int, char *, int *);
+static int injected_recv(SOCKET, char *, int, int);
+static int injected_ioctlsocket(SOCKET, long, u_long *);
 static int injected_select(int, fd_set *, fd_set *, fd_set *, const struct timeval *);
 static HANDLE injected_create_event(LPSECURITY_ATTRIBUTES, BOOL, BOOL, LPCSTR);
 static HANDLE injected_create_thread(LPSECURITY_ATTRIBUTES, SIZE_T, LPTHREAD_START_ROUTINE,
@@ -39,6 +42,8 @@ static int injected_accept(int, struct sockaddr *, socklen_t *);
 static int injected_connect(int, const struct sockaddr *, socklen_t);
 static int injected_close(int);
 static int injected_getsockopt(int, int, int, void *, socklen_t *);
+static ssize_t injected_recv(int, void *, size_t, int);
+static int injected_ioctl(int, unsigned long, int *);
 static int injected_poll(struct pollfd *, nfds_t, int);
 static int injected_pipe(int *);
 static int injected_pthread_create(pthread_t *, const pthread_attr_t *,
@@ -51,7 +56,9 @@ static int injected_pthread_create(pthread_t *, const pthread_attr_t *,
 #define connect injected_connect
 #define getsockopt injected_getsockopt
 #define calloc injected_calloc
+#define recv injected_recv
 #ifdef _WIN32
+#define ioctlsocket injected_ioctlsocket
 #undef CreateEvent
 #define CreateEvent injected_create_event
 #define CreateThread injected_create_thread
@@ -61,6 +68,7 @@ static int injected_pthread_create(pthread_t *, const pthread_attr_t *,
 #define WSAEventSelect injected_wsa_event_select
 #else
 #define close injected_close
+#define ioctl injected_ioctl
 #define poll injected_poll
 #define pipe injected_pipe
 #define pthread_create injected_pthread_create
@@ -74,7 +82,9 @@ static int injected_pthread_create(pthread_t *, const pthread_attr_t *,
 #undef connect
 #undef getsockopt
 #undef calloc
+#undef recv
 #ifdef _WIN32
+#undef ioctlsocket
 #undef CreateEvent
 #undef CreateThread
 #undef closesocket
@@ -83,6 +93,7 @@ static int injected_pthread_create(pthread_t *, const pthread_attr_t *,
 #undef WSAEventSelect
 #else
 #undef close
+#undef ioctl
 #undef poll
 #undef pipe
 #undef pthread_create
@@ -105,6 +116,10 @@ static atomic_uint held_dns_calls = ATOMIC_VAR_INIT(0);
 static atomic_uint held_dns_freed = ATOMIC_VAR_INIT(0);
 static _Atomic(struct addrinfo *) held_results[MAX_RESOLVERS];
 static int resolver_setup_failure;
+/* Only the chosen control socket has a continuously replenished receive queue. */
+static socket_t continuous_control = INVALID_FD;
+static unsigned int continuous_reads;
+static int control_query_failure;
 #ifdef _WIN32
 static HANDLE failed_resolver_event;
 static WSAEVENT failed_control_event;
@@ -173,6 +188,46 @@ static void set_test_error(int error) {
     WSASetLastError(error);
 #else
     errno = error;
+#endif
+}
+
+#ifdef _WIN32
+static int injected_recv(SOCKET fd, char *buffer, int length, int flags) {
+#else
+static ssize_t injected_recv(int fd, void *buffer, size_t length, int flags) {
+#endif
+    if (fd != continuous_control) return recv(fd, buffer, length, flags);
+    if (!(flags & MSG_PEEK)) {
+        ++continuous_reads;
+        retry_pause(1);
+    }
+    memset(buffer, 'c', (size_t)length);
+    return length;
+}
+
+#ifdef _WIN32
+static int injected_ioctlsocket(SOCKET fd, long request, u_long *pending) {
+#else
+static int injected_ioctl(int fd, unsigned long request, int *pending) {
+#endif
+    if (fd == continuous_control && request == FIONREAD) {
+        if (control_query_failure) {
+            int interrupted_query = control_query_failure == 2;
+            if (interrupted_query) control_query_failure = 0;
+#ifdef _WIN32
+            set_test_error(interrupted_query ? WSAEINTR : WSAEINVAL);
+#else
+            set_test_error(interrupted_query ? EINTR : EIO);
+#endif
+            return -1;
+        }
+        *pending = 4096;
+        return 0;
+    }
+#ifdef _WIN32
+    return ioctlsocket(fd, request, pending);
+#else
+    return ioctl(fd, request, pending);
 #endif
 }
 
@@ -590,6 +645,82 @@ static void control_pair(socket_t pair[2]) {
     close_socket(listener);
 }
 
+static void test_udp_control_fairness(void) {
+#ifdef _WIN32
+    WSADATA winsock;
+    assert(WSAStartup(MAKEWORD(2, 2), &winsock) == 0);
+#endif
+    socket_t control[2];
+    control_pair(control);
+    struct resolver_job ready = {0};
+#ifdef _WIN32
+    ready.ready = CreateEventA(NULL, TRUE, TRUE, NULL);
+    assert(ready.ready != NULL);
+#else
+    assert(pipe(ready.ready) == 0);
+    assert(write(ready.ready[1], "r", 1) == 1);
+#endif
+    continuous_control = control[0];
+    continuous_reads = 0;
+    /* Ready DNS must be observed before the budget expires, despite new bytes. */
+    uint64_t start = monotonic_milliseconds();
+    assert(wait_for_resolver(&ready, control[0], RESOLVE_UDP, start + 400));
+    assert(continuous_reads && monotonic_milliseconds() - start < 250);
+    control_query_failure = 1;
+    assert(!wait_for_resolver(&ready, control[0], RESOLVE_UDP,
+                              monotonic_milliseconds() + 400));
+    control_query_failure = 2;
+    assert(wait_for_resolver(&ready, control[0], RESOLVE_UDP,
+                             monotonic_milliseconds() + 400));
+    assert(control_query_failure == 0);
+    assert(!udp_control_open(control[0], monotonic_milliseconds()));
+
+    socket_t target = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    assert(target != INVALID_FD);
+    struct sockaddr_in local = {0};
+    local.sin_family = AF_INET;
+    local.sin_addr.s_addr = htonl(TEST_LOOPBACK_IP);
+    assert(bind(target, (struct sockaddr *)&local, sizeof(local)) == 0);
+    socklen_t length = sizeof(local);
+    assert(getsockname(target, (struct sockaddr *)&local, &length) == 0);
+    unsigned short port = ntohs(local.sin_port);
+    const char host[] = "fair.test";
+    const char payload[] = "pending UDP payload stays intact";
+    unsigned char packet[7 + sizeof(host) - 1 + sizeof(payload)] = {0, 0, 0, 3};
+    packet[4] = sizeof(host) - 1;
+    memcpy(packet + 5, host, sizeof(host) - 1);
+    packet[5 + sizeof(host) - 1] = (unsigned char)(port >> 8);
+    packet[6 + sizeof(host) - 1] = (unsigned char)port;
+    memcpy(packet + 7 + sizeof(host) - 1, payload, sizeof(payload));
+    socket_t ipv4 = INVALID_FD, ipv6 = INVALID_FD;
+    struct udp_destination destinations[UDP_DESTINATION_LIMIT] = {{0}};
+    struct udp_dns_entry cache[UDP_DNS_CACHE_LIMIT] = {{0}};
+    fake_dns = 1;
+    assert(forward_udp_request(packet, sizeof(packet), &ipv4, &ipv6, destinations,
+                                cache, monotonic_milliseconds() + 2000, control[0]) == 1);
+    assert(wait_for_io(target, POLLIN, monotonic_milliseconds() + 1000));
+    char received[sizeof(payload) + 1];
+    assert(recvfrom(target, received, sizeof(received), 0, NULL, NULL) == sizeof(payload));
+    assert(memcmp(received, payload, sizeof(payload)) == 0);
+    assert(cached_entry(cache, host)->address.ss_family == AF_INET);
+    wait_for_resolvers();
+    fake_dns = 0;
+    continuous_control = INVALID_FD;
+    if (ipv4 != INVALID_FD) close_socket(ipv4);
+    if (ipv6 != INVALID_FD) close_socket(ipv6);
+    close_socket(target);
+    close_socket(control[0]);
+    close_socket(control[1]);
+#ifdef _WIN32
+    CloseHandle(ready.ready);
+    WSACleanup();
+#else
+    close(ready.ready[0]);
+    close(ready.ready[1]);
+#endif
+    puts("UDP control fairness checks passed (continuous input, ready DNS, query errors, intact payload).");
+}
+
 struct control_closer {
     socket_t peer;
     unsigned int dns_calls;
@@ -992,6 +1123,7 @@ int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--test-internals")) {
         test_dns_cache();
         puts("UDP DNS checks passed (100 literals, zero resolutions; 100 case variants, one resolution; syntax, TTL, ports, failures).");
+        test_udp_control_fairness();
         test_connection_fallback();
         test_resolver_deadline_and_limit();
         test_resolver_control_close();
