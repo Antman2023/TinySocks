@@ -6,7 +6,8 @@ ZIG_LOCAL_CACHE_DIR ?= $(CURDIR)/.zig-cache-local
 export ZIG_GLOBAL_CACHE_DIR ZIG_LOCAL_CACHE_DIR
 
 COMMON_FLAGS := -std=c11 -O2 -Wall -Wextra -Werror
-LINUX_FLAGS := $(COMMON_FLAGS) -flto -ffunction-sections -fdata-sections -Wl,--gc-sections -s
+# musl uses GNU_STACK to size pthread stacks; Zig's default hint becomes 8 MiB.
+LINUX_FLAGS := $(COMMON_FLAGS) -flto -ffunction-sections -fdata-sections -Wl,--gc-sections -Wl,-z,stack-size=1048576 -s
 # Zig 0.16's Windows and macOS linkers do not support this Linux LTO setup.
 WINDOWS_FLAGS := $(COMMON_FLAGS) -ffunction-sections -fdata-sections -Wl,--gc-sections -s
 MACOS_FLAGS := $(COMMON_FLAGS) -Wl,-dead_strip -s
@@ -14,7 +15,7 @@ MACOS_FLAGS := $(COMMON_FLAGS) -Wl,-dead_strip -s
 MIPS_FLAGS := -std=c11 -Oz -flto -Wall -Wextra \
               -ffunction-sections -fdata-sections \
               -fno-unwind-tables -fno-asynchronous-unwind-tables \
-              -Wl,--gc-sections -s
+              -Wl,--gc-sections -Wl,-z,stack-size=1048576 -s
 
 ifeq ($(OS),Windows_NT)
 HOST_OUTPUT := tinysocks.exe

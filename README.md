@@ -24,6 +24,8 @@ Linux 和 macOS 程序下载后需要添加执行权限，例如 `chmod +x tinys
 
 发布程序保留 `-O2` 优化，移除调试信息并清理未使用代码；Linux 还使用链接时优化（LTO）。Windows 和 macOS 使用各自支持的链接参数。发布附件只包含九个程序及校验文件，不包含 PDB 调试文件。CI 会下载实际构建附件，在三个系统上校验 SHA256 并执行协议测试，通过后才创建 Release。
 
+静态 Linux 附件通过 ELF 栈声明将 musl 的默认客户端及解析线程栈设为 1 MiB，避免 Zig 的默认声明使每个线程预留 8 MiB 地址空间。64 个客户端的栈预留由约 512 MiB 降至 64 MiB；这是虚拟地址空间预留，不等同于实际驻留内存。MIPS 发布代码中的 UDP 主函数栈帧约为 76 KiB，TCP 转发约为 32 KiB，分别位于独立函数中；1 MiB 为调用链及系统解析器保留余量。声明由 [musl 初始化代码](https://github.com/ziglang/zig/blob/0.16.0/lib/libc/musl/src/env/__init_tls.c)读取；自定义 Linux 编译命令也应保留相应链接参数。
+
 CI 为 Zig 库目录创建固定路径，避免编译器每次解压到不同临时目录后重复构建 C 运行库。Linux 和 macOS 使用符号链接，Windows 使用临时盘上的目录联接；编译器版本、编译选项及源码仍参与正常的缓存检查。
 
 ## 编译
@@ -48,7 +50,7 @@ zig cc -std=c11 -O2 -Wall -Wextra -ffunction-sections -fdata-sections '-Wl,--gc-
 Linux：
 
 ```sh
-zig cc -std=c11 -O2 -flto -Wall -Wextra -ffunction-sections -fdata-sections '-Wl,--gc-sections' -s tinysocks.c -o tinysocks -pthread
+zig cc -std=c11 -O2 -flto -Wall -Wextra -ffunction-sections -fdata-sections '-Wl,--gc-sections' '-Wl,-z,stack-size=1048576' -s tinysocks.c -o tinysocks -pthread
 ```
 
 macOS：
@@ -61,10 +63,10 @@ Linux MIPS 交叉编译（静态链接，按体积优化，适用于相应的 MI
 
 ```sh
 # 小端 MIPS (mipsel)
-zig cc -target mipsel-linux-musleabi -std=c11 -Oz -flto -ffunction-sections -fdata-sections -fno-unwind-tables -fno-asynchronous-unwind-tables '-Wl,--gc-sections' -s tinysocks.c -o tinysocks-mipsel -pthread -static
+zig cc -target mipsel-linux-musleabi -std=c11 -Oz -flto -ffunction-sections -fdata-sections -fno-unwind-tables -fno-asynchronous-unwind-tables '-Wl,--gc-sections' '-Wl,-z,stack-size=1048576' -s tinysocks.c -o tinysocks-mipsel -pthread -static
 
 # 大端 MIPS (mips)
-zig cc -target mips-linux-musleabi -std=c11 -Oz -flto -ffunction-sections -fdata-sections -fno-unwind-tables -fno-asynchronous-unwind-tables '-Wl,--gc-sections' -s tinysocks.c -o tinysocks-mips -pthread -static
+zig cc -target mips-linux-musleabi -std=c11 -Oz -flto -ffunction-sections -fdata-sections -fno-unwind-tables -fno-asynchronous-unwind-tables '-Wl,--gc-sections' '-Wl,-z,stack-size=1048576' -s tinysocks.c -o tinysocks-mips -pthread -static
 ```
 
 目标设备如果使用 hard-float ABI，可把目标名中的 `musleabi` 改为 `musleabihf`。请按设备的大小端和 ABI 选择对应产物。
@@ -132,6 +134,8 @@ make test
 Windows 上默认使用 `python`，其他平台使用 `python3`；可通过 `make test PYTHON=解释器路径` 指定解释器。
 
 `make test` 使用与本机发布程序相同的优化和链接参数。`make test-release` 则编译并测试默认运行限制的本机程序；跨平台附件也可用 `python tests/test_proxy.py 程序路径 --release -v` 检查。发布测试保留 TCP/UDP、域名、IPv4/IPv6、背压和半关闭等协议检查，仅跳过依赖短超时或两客户端限制的检查及故障注入专用检查；这些检查仍由 `make test` 和内存检查任务执行。
+
+Linux 正式附件另在 128 MiB 进程地址空间限制下同时保持默认的 64 个 UDP 会话，确认每个会话可完整转发最大 IPv4 载荷及域名报文，并报告进程的虚拟内存、驻留内存和线程数。该检查只约束代理子进程，不限制测试进程；其他系统及短期限测试程序跳过它。
 
 测试还验证 UDP 域名缓存的不同端口转发、固定过期、容量淘汰和失败重解析；受控解析器确认同一域名的 16 种大小写变体连续发送 100 个数据报只调用一次解析器、只占一项缓存。覆盖尾点、ASCII 编码的国际化域名、下划线、作用域、转义和非 ASCII 输入的缓存边界，并检查原始解析拼写和失败重解析。端到端故障测试先填满解析名额，再验证缓存名称的大小写变体仍能向不同端口转发并接收回复。故障注入程序先模拟连接中断与资源不足，再执行 TCP/UDP 和 IPv6 端到端测试，验证监听服务能够恢复。GitHub Actions 的三个系统均执行这些检查。
 
