@@ -335,7 +335,7 @@ struct resolver_job {
     char host[256], port[6];
     struct addrinfo hints, *addresses;
     int error;
-    uint64_t completed_at_ms;
+    uint64_t deadline_ms, completed_at_ms;
     atomic_uint references;
     atomic_int completed;
 #ifdef _WIN32
@@ -363,7 +363,10 @@ static DWORD WINAPI resolver_thread(LPVOID argument) {
 static void *resolver_thread(void *argument) {
 #endif
     struct resolver_job *job = argument;
-    job->error = getaddrinfo(job->host, job->port, &job->hints, &job->addresses);
+    /* A newly created worker may not be scheduled until its caller has expired. */
+    job->error = EAI_AGAIN;
+    if (remaining_milliseconds(job->deadline_ms))
+        job->error = getaddrinfo(job->host, job->port, &job->hints, &job->addresses);
     job->completed_at_ms = monotonic_milliseconds();
     atomic_store_explicit(&job->completed, 1, memory_order_release);
 #ifdef _WIN32
@@ -485,6 +488,7 @@ static int resolve_target(const char *host, const char *port, const struct addri
     strcpy(job->host, host);
     strcpy(job->port, port);
     job->hints = *hints;
+    job->deadline_ms = deadline_ms;
 #ifdef _WIN32
     job->ready = CreateEvent(NULL, TRUE, FALSE, NULL);
     if (!job->ready || !resolver_can_start(control, mode, deadline_ms)) goto failed;

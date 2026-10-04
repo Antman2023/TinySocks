@@ -152,6 +152,10 @@ static socket_t resolver_setup_control = INVALID_FD, resolver_setup_peer = INVAL
 static unsigned int resolver_setup_starts;
 static void *resolver_setup_job;
 static const char resolver_setup_payload[] = "queued setup payload";
+static int resolver_entry_delay;
+static unsigned int resolver_entry_advance_seconds;
+static atomic_int resolver_entry_started = ATOMIC_VAR_INIT(0);
+static atomic_uint resolver_entry_calls = ATOMIC_VAR_INIT(0);
 /* Private CLI mode: only the accept thread owns these failure-phase fields. */
 static int fail_client_setup;
 static unsigned int failed_client_allocations, failed_client_threads;
@@ -204,7 +208,7 @@ static int injected_clock_gettime(clockid_t clock, struct timespec *now) {
 static void *injected_calloc(size_t count, size_t size) {
     if (resolver_setup_failure == 1) return NULL;
     void *result = calloc(count, size);
-    if (resolver_setup_action) resolver_setup_job = result;
+    if (resolver_setup_action || resolver_entry_delay) resolver_setup_job = result;
     return result;
 }
 
@@ -288,6 +292,17 @@ static void *short_io_client_thread(void *argument) {
 }
 
 #ifdef _WIN32
+static DWORD WINAPI delayed_resolver_entry(LPVOID argument) {
+#else
+static void *delayed_resolver_entry(void *argument) {
+#endif
+    atomic_store_explicit(&clock_advance_seconds, resolver_entry_advance_seconds,
+                           memory_order_relaxed);
+    atomic_store_explicit(&resolver_entry_started, 1, memory_order_release);
+    return resolver_thread(argument);
+}
+
+#ifdef _WIN32
 static HANDLE injected_create_event(LPSECURITY_ATTRIBUTES attributes, BOOL manual_reset,
                                      BOOL initial_state, LPCSTR name) {
     if (resolver_setup_failure == 2) return NULL;
@@ -297,6 +312,7 @@ static HANDLE injected_create_event(LPSECURITY_ATTRIBUTES attributes, BOOL manua
         failed_resolver_event = event;
         finish_resolver_setup();
     }
+    if (event && resolver_entry_delay) failed_resolver_event = event;
     return event;
 }
 
@@ -309,6 +325,7 @@ static HANDLE injected_create_thread(LPSECURITY_ATTRIBUTES attributes, SIZE_T st
     }
     if (resolver_setup_failure == 3 && start == resolver_thread) return NULL;
     if (resolver_setup_action && start == resolver_thread) ++resolver_setup_starts;
+    if (resolver_entry_delay && start == resolver_thread) start = delayed_resolver_entry;
     if (short_tcp_io && start == client_thread) start = short_io_client_thread;
     return CreateThread(attributes, stack_size, start, argument, flags, thread_id);
 }
@@ -334,7 +351,7 @@ static int injected_pipe(int *fds) {
         return -1;
     }
     int result = pipe(fds);
-    if (!result && (resolver_setup_failure == 3 || resolver_setup_action)) {
+    if (!result && (resolver_setup_failure == 3 || resolver_setup_action || resolver_entry_delay)) {
         failed_resolver_pipe[0] = fds[0];
         failed_resolver_pipe[1] = fds[1];
         if (resolver_setup_action) finish_resolver_setup();
@@ -347,6 +364,7 @@ static int injected_pthread_create(pthread_t *thread, const pthread_attr_t *attr
     if (start == client_thread && fail_client_thread(argument)) return EAGAIN;
     if (resolver_setup_failure == 3 && start == resolver_thread) return EAGAIN;
     if (resolver_setup_action && start == resolver_thread) ++resolver_setup_starts;
+    if (resolver_entry_delay && start == resolver_thread) start = delayed_resolver_entry;
     if (short_tcp_io && start == client_thread) start = short_io_client_thread;
     return pthread_create(thread, attributes, start, argument);
 }
@@ -510,6 +528,8 @@ static void injected_freeaddrinfo(struct addrinfo *addresses) {
 
 static int injected_getaddrinfo(const char *host, const char *port,
                                 const struct addrinfo *hints, struct addrinfo **result) {
+    if (resolver_entry_delay)
+        atomic_fetch_add_explicit(&resolver_entry_calls, 1, memory_order_relaxed);
     if (!strcmp(host, "held.test") || !strcmp(host, "reset.test")) {
         unsigned int slot = atomic_fetch_add_explicit(&held_dns_calls, 1, memory_order_relaxed);
         assert(slot < MAX_RESOLVERS);
@@ -1871,6 +1891,75 @@ static void test_resolver_setup_cancellation(void) {
     puts("Resolver setup checks passed (expired budgets, UDP FIN, TCP reset, no worker starts, cleanup, TCP payload/FIN, recovery).");
 }
 
+static void test_resolver_delayed_entry(void) {
+#ifdef _WIN32
+    WSADATA winsock;
+    assert(WSAStartup(MAKEWORD(2, 2), &winsock) == 0);
+#endif
+    struct addrinfo hints = {0};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_NUMERICSERV;
+    for (int mode = RESOLVE_TCP; mode <= RESOLVE_UDP; ++mode) {
+        for (int expired = 0; expired <= 1; ++expired) {
+            reset_held_dns();
+            socket_t control[2];
+            control_pair(control);
+            resolver_entry_delay = 1;
+            resolver_entry_advance_seconds = expired ? 2 : 1;
+            atomic_store_explicit(&resolver_entry_started, 0, memory_order_relaxed);
+            atomic_store_explicit(&resolver_entry_calls, 0, memory_order_relaxed);
+            struct addrinfo *addresses = NULL;
+            int error = resolve_target(expired ? "held.test" : "127.0.0.1", "80", &hints,
+                                        &addresses, monotonic_milliseconds() + (expired ? 1000 : 5000),
+                                        control[0], (enum resolver_control_mode)mode);
+            /* Observe entry before using the shifted clock for a cleanup wait. */
+            unsigned int waits = 0;
+            while (!atomic_load_explicit(&resolver_entry_started, memory_order_acquire)) {
+                assert(waits++ < 1000);
+                retry_pause(1);
+            }
+            atomic_store_explicit(&release_held_dns, 1, memory_order_release);
+            wait_for_resolvers();
+            unsigned int calls = atomic_load_explicit(&resolver_entry_calls, memory_order_relaxed);
+            resolver_entry_delay = 0;
+            atomic_store_explicit(&clock_advance_seconds, 0, memory_order_relaxed);
+            printf("Resolver delayed entry: mode=%d expired=%d calls=%u slots=%u\n",
+                   mode, expired, calls,
+                   atomic_load_explicit(&active_resolvers, memory_order_acquire));
+            fflush(stdout);
+            if (expired) {
+                assert(error == EAI_AGAIN && addresses == NULL && calls == 0);
+                assert(atomic_load_explicit(&held_dns_calls, memory_order_relaxed) == 0);
+            } else {
+                assert(error == 0 && addresses != NULL && calls == 1);
+                freeaddrinfo(addresses);
+            }
+            assert(resolver_setup_job == NULL);
+#ifdef _WIN32
+            assert(WaitForSingleObject(failed_resolver_event, 0) == WAIT_FAILED);
+            assert(GetLastError() == ERROR_INVALID_HANDLE);
+#else
+            for (int i = 0; i < 2; ++i) {
+                assert(fcntl(failed_resolver_pipe[i], F_GETFD) == -1);
+                assert(errno == EBADF);
+            }
+#endif
+            close_socket(control[0]);
+            close_socket(control[1]);
+            assert(resolve_target("127.0.0.1", "80", &hints, &addresses,
+                                  monotonic_milliseconds() + 1000, INVALID_FD, RESOLVE_TCP) == 0);
+            freeaddrinfo(addresses);
+            wait_for_resolvers();
+        }
+    }
+    reset_held_dns();
+#ifdef _WIN32
+    WSACleanup();
+#endif
+    puts("Resolver entry checks passed (original budget, expired worker skips resolver, valid worker resolves, cleanup, recovery).");
+}
+
 static void test_resolver_deadline_and_limit(void) {
 #ifdef _WIN32
     WSADATA winsock;
@@ -2112,6 +2201,7 @@ int main(int argc, char **argv) {
         test_expired_ready_events();
         test_connection_fallback();
         test_resolver_setup_cancellation();
+        test_resolver_delayed_entry();
         test_resolver_deadline_and_limit();
         test_resolver_control_close();
         test_resolver_tcp_reset();
