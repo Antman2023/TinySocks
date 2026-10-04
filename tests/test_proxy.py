@@ -503,16 +503,18 @@ class ProxyTests(ProxyTestCase):
     def test_tcp_half_close_under_backpressure(self):
         for upstream in (False, True):
             with self.subTest(upstream=upstream), socket.socket() as listener:
-                listener.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+                # A tiny negotiated TCP window can take longer than the 3-second
+                # idle limit to drain kernel queues after the relay sent its FIN.
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
                 listener.bind(("127.0.0.1", 0))
                 listener.listen()
                 listener.settimeout(2)
                 with self.control() as control:
-                    control.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+                    control.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
                     control.sendall(b"\x05\x01\x00" + encode_address(*listener.getsockname()))
                     self.assertEqual(read_reply(control)[0][:2], b"\x05\x00")
                     with listener.accept()[0] as target:
-                        target.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+                        target.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
                         source = target if upstream else control
                         destination = control if upstream else target
                         sent = self.fill_tcp_direction(source, destination)
