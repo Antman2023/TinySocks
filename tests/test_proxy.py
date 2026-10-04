@@ -1509,5 +1509,82 @@ class WindowsUDPIPv6BindingTests(WindowsUDPBindingTests):
     listen_host = "::1"
 
 
+@unittest.skipUnless(RELEASE_ENABLED and sys.platform == "linux",
+                     "requires the default Linux release and address-space limits")
+class LinuxReleaseResourceTests(ProxyTestCase):
+    def test_default_clients_under_address_space_limit(self):
+        import resource
+
+        limit = 128 * 1024 * 1024
+        resource.prlimit(self.proxy.pid, resource.RLIMIT_AS, (limit, limit))
+
+        def usage():
+            fields = {}
+            for line in Path(f"/proc/{self.proxy.pid}/status").read_text().splitlines():
+                key, value = line.split(":", 1)
+                if key in ("VmSize", "VmPeak", "VmRSS", "Threads"):
+                    fields[key] = int(value.split()[0])
+            return fields
+
+        # Keep every association alive together; sequential short-lived requests
+        # would hide the virtual memory reserved by the worker thread stacks.
+        sessions = []
+        for index in range(64):
+            try:
+                control = self.control()
+                endpoint = self.associate(control)
+            except (OSError, EOFError) as error:
+                self.fail(f"only {index}/64 clients admitted under 128 MiB: "
+                          f"{error}; {usage()}")
+            client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.addCleanup(client.close)
+            client.bind((self.listen_host, 0))
+            client.settimeout(3)
+            client.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 131072)
+            client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 131072)
+            sessions.append((client, endpoint))
+        self.assertEqual(usage()["Threads"], 65)
+
+        with ExitStack() as stack:
+            ipv4 = stack.enter_context(socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
+            ipv4.bind((self.listen_host, 0))
+            targets = [ipv4]
+            # localhost may resolve to either family. Listen on the same port
+            # in both families so the test keeps the system resolver's order.
+            try:
+                ipv6 = stack.enter_context(socket.socket(socket.AF_INET6, socket.SOCK_DGRAM))
+                ipv6.bind(("::1", ipv4.getsockname()[1]))
+                targets.append(ipv6)
+            except OSError as error:
+                if error.errno not in (errno.EAFNOSUPPORT, errno.EADDRNOTAVAIL):
+                    raise
+            for target in targets:
+                target.settimeout(3)
+                target.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 131072)
+                target.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 131072)
+
+            numeric = encode_address(*ipv4.getsockname())
+            domain = encode_address("localhost", ipv4.getsockname()[1], domain=True)
+            random_bytes = random.Random(41).getrandbits(65496 * 8).to_bytes(65496, "little")
+            for index, (client, endpoint) in enumerate(sessions):
+                # Touch the large UDP frame in every worker, then exercise the
+                # independent resolver thread and the waiting caller's stack.
+                for address, data in ((numeric, bytes([index]) + random_bytes),
+                                      (domain, bytes([index]) + random_bytes[:32767])):
+                    with self.subTest(client=index, domain=address == domain):
+                        client.sendto(bytes(3) + address + data, endpoint)
+                        ready = select.select(targets, [], [], 3)[0]
+                        self.assertEqual(len(ready), 1)
+                        target = ready[0]
+                        received, source = target.recvfrom(65536)
+                        self.assertEqual(received, data)
+                        target.sendto(received, source)
+                        reply = bytes(3) + encode_address(*target.getsockname()[:2]) + data
+                        self.assertEqual(client.recvfrom(65536)[0], reply)
+        measured = usage()
+        self.assertLessEqual(measured["VmPeak"], limit // 1024)
+        print(f"Linux 64-client resource check: {measured}", flush=True)
+
+
 if __name__ == "__main__":
     unittest.main()
