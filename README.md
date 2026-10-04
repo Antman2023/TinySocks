@@ -24,7 +24,7 @@ Linux 和 macOS 程序下载后需要添加执行权限，例如 `chmod +x tinys
 
 发布程序保留 `-O2` 优化，移除调试信息并清理未使用代码；Linux 还使用链接时优化（LTO）。Windows 和 macOS 使用各自支持的链接参数。发布附件只包含九个程序及校验文件，不包含 PDB 调试文件。CI 会下载实际构建附件，在三个系统上校验 SHA256 并执行协议测试，通过后才创建 Release。
 
-静态 Linux 附件通过 ELF 栈声明将 musl 的默认客户端及解析线程栈设为 1 MiB，避免 Zig 的默认声明使每个线程预留 8 MiB 地址空间。64 个客户端的栈预留由约 512 MiB 降至 64 MiB；这是虚拟地址空间预留，不等同于实际驻留内存。MIPS 发布代码中的 UDP 主函数栈帧约为 76 KiB，TCP 转发约为 32 KiB，分别位于独立函数中；1 MiB 为调用链及系统解析器保留余量。声明由 [musl 初始化代码](https://github.com/ziglang/zig/blob/0.16.0/lib/libc/musl/src/env/__init_tls.c)读取；自定义 Linux 编译命令也应保留相应链接参数。
+静态 Linux 附件通过 ELF 栈声明将 musl 的默认客户端及解析线程栈设为 1 MiB，避免 Zig 的默认声明使每个线程预留 8 MiB 地址空间。64 个客户端的栈预留由约 512 MiB 降至 64 MiB；这是虚拟地址空间预留，不等同于实际驻留内存。MIPS 发布代码中的 UDP 主函数栈帧约为 76 KiB，TCP 转发约为 32 KiB，分别位于独立函数中；1 MiB 为调用链及系统解析器保留余量。声明由 [musl 初始化代码](https://github.com/ziglang/zig/blob/master/lib/libc/musl/src/env/__init_tls.c)读取；自定义 Linux 编译命令也应保留相应链接参数。
 
 CI 为 Zig 库目录创建固定路径，避免编译器每次解压到不同临时目录后重复构建 C 运行库。Linux 和 macOS 使用符号链接，Windows 使用临时盘上的目录联接；编译器版本、编译选项及源码仍参与正常的缓存检查。
 
