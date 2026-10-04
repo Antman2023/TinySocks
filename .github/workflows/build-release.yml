@@ -47,7 +47,8 @@ jobs:
         run: |
           clang -std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer -DMAX_CLIENTS=2 -DIDLE_TIMEOUT_SECONDS=3 -DHANDSHAKE_TIMEOUT_SECONDS=1 tests/test_faults.c -o fault-sanitized -pthread
           ./fault-sanitized --test-internals
-          python3 tests/test_proxy.py ./fault-sanitized --faults FaultProxyTests FaultClientSetupTests \
+          python3 tests/test_proxy.py ./fault-sanitized --faults FaultProxyTests \
+            FaultClientSetupTests FaultTCPIOTests \
             ProxyTests.test_domain_connect_and_pipelined_payload \
             ProxyTests.test_udp_domain_and_empty_payload \
             ProxyTests.test_tcp_client_reset_under_backpressure_releases_slot \

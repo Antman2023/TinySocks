@@ -60,7 +60,8 @@ test-release: $(HOST_OUTPUT)
 test: $(TEST_OUTPUT) $(FAULT_TEST_OUTPUT)
 	$(PYTHON) tests/test_proxy.py ./$(TEST_OUTPUT) -v
 	./$(FAULT_TEST_OUTPUT) --test-internals
-	$(PYTHON) tests/test_proxy.py ./$(FAULT_TEST_OUTPUT) --faults FaultProxyTests FaultClientSetupTests \
+	$(PYTHON) tests/test_proxy.py ./$(FAULT_TEST_OUTPUT) --faults FaultProxyTests \
+		FaultClientSetupTests FaultTCPIOTests \
 		ProxyTests.test_domain_connect_and_pipelined_payload \
 		ProxyTests.test_udp_domain_and_empty_payload IPv6ProxyTests \
 		WildcardListenerTests WildcardIPv6ListenerTests \

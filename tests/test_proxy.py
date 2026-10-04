@@ -12,6 +12,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from pathlib import Path
+from threading import Barrier
 
 
 BINARY = Path(sys.argv.pop(1)).resolve()
@@ -115,6 +116,42 @@ class ProxyTestCase(unittest.TestCase):
         except ConnectionError:
             pass
 
+    def simultaneous_tcp_streams(self):
+        # Different aperiodic streams expose loss, repetition and cross-direction mixing.
+        upload_size, download_size = 1024 * 1024 + 137, 1024 * 1024 + 509
+        upload = random.Random(21).getrandbits(upload_size * 8).to_bytes(upload_size, "little")
+        download = random.Random(22).getrandbits(download_size * 8).to_bytes(download_size, "little")
+        with ThreadPoolExecutor(max_workers=4) as pool, socket.socket() as listener, \
+                self.control() as control:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            listener.settimeout(2)
+            control.sendall(b"\x05\x01\x00" + encode_address(*listener.getsockname()))
+            self.assertEqual(read_reply(control)[0][:3], b"\x05\x00\x00")
+            with listener.accept()[0] as target:
+                control.settimeout(2)
+                target.settimeout(2)
+                start = Barrier(4)
+
+                def write_stream(sock, payload):
+                    start.wait(timeout=2)
+                    sock.sendall(payload)
+                    sock.shutdown(socket.SHUT_WR)
+
+                def read_stream(sock, payload):
+                    start.wait(timeout=2)
+                    self.assertEqual(recv_exact(sock, len(payload)), payload)
+                    self.assertEqual(sock.recv(1), b"")
+
+                jobs = [pool.submit(write_stream, control, upload),
+                        pool.submit(write_stream, target, download),
+                        pool.submit(read_stream, target, upload),
+                        pool.submit(read_stream, control, download)]
+                for job in jobs:
+                    job.result(timeout=5)
+        self.assertIsNone(self.proxy.poll())
+        return upload_size + download_size
+
 
 @unittest.skipUnless(FAULTS_ENABLED, "requires the fault-injection binary (--faults)")
 class FaultClientSetupTests(ProxyTestCase):
@@ -154,6 +191,30 @@ class FaultClientSetupTests(ProxyTestCase):
         self.assertEqual(lines, [f"Fault client setup: allocation {i}" for i in range(1, 4)]
                          + [f"Fault client setup: thread {i}" for i in range(1, 4)]
                          + ["Fault client setup: recovered"])
+
+
+@unittest.skipUnless(FAULTS_ENABLED, "requires the fault-injection binary (--faults)")
+class FaultTCPIOTests(ProxyTestCase):
+    proxy_arguments = ("--short-tcp-io",)
+
+    def test_simultaneous_streams_survive_short_io_and_transient_errors(self):
+        payload_size = self.simultaneous_tcp_streams()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            try:
+                line = pool.submit(self.proxy.stderr.readline).result(timeout=2).strip()
+            except BaseException:
+                self.stop_proxy()
+                raise
+        self.assertTrue(line.startswith("Fault TCP IO: "), line)
+        counts = {key: int(value) for key, value in
+                  (entry.split("=") for entry in line[len("Fault TCP IO: "):].split())}
+        self.assertGreaterEqual(counts.pop("sent"), payload_size)
+        self.assertGreaterEqual(counts.pop("received"), payload_size)
+        self.assertEqual(set(counts), {"short_sends", "limited_receives", "send_interrupts",
+                                      "send_blocks", "receive_interrupts", "receive_blocks"})
+        for operation, count in counts.items():
+            self.assertGreater(count, 0, f"{operation} was not exercised")
+        self.assertIsNone(self.proxy.poll())
 
 
 class CommandLineTests(unittest.TestCase):
@@ -418,6 +479,9 @@ class ProxyTests(ProxyTestCase):
                     control.settimeout(1)
                     self.assertEqual(recv_exact(control, 7), b"reverse")
                     control.shutdown(socket.SHUT_RDWR)
+
+    def test_tcp_simultaneous_streams_and_half_close(self):
+        self.simultaneous_tcp_streams()
 
     def test_tcp_large_payload_drains_before_half_close(self):
         # An aperiodic pattern exposes byte loss or reordering at buffer wraps.

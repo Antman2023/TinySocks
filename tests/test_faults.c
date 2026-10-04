@@ -34,6 +34,7 @@ static int injected_close(SOCKET);
 static int injected_getsockopt(SOCKET, int, int, char *, int *);
 static int injected_setsockopt(SOCKET, int, int, const char *, int);
 static int injected_recv(SOCKET, char *, int, int);
+static int injected_send(SOCKET, const char *, int, int);
 static int injected_ioctlsocket(SOCKET, long, u_long *);
 static int injected_wsa_poll(WSAPOLLFD *, ULONG, INT);
 static ULONGLONG injected_tick_count(void);
@@ -49,6 +50,7 @@ static int injected_connect(int, const struct sockaddr *, socklen_t);
 static int injected_close(int);
 static int injected_getsockopt(int, int, int, void *, socklen_t *);
 static ssize_t injected_recv(int, void *, size_t, int);
+static ssize_t injected_send(int, const void *, size_t, int);
 static int injected_ioctl(int, unsigned long, int *);
 static int injected_poll(struct pollfd *, nfds_t, int);
 static int injected_clock_gettime(clockid_t, struct timespec *);
@@ -66,6 +68,7 @@ static int injected_pthread_create(pthread_t *, const pthread_attr_t *,
 #define malloc injected_malloc
 #define free injected_free
 #define recv injected_recv
+#define send injected_send
 #ifdef _WIN32
 #define setsockopt injected_setsockopt
 #define ioctlsocket injected_ioctlsocket
@@ -98,6 +101,7 @@ static int injected_pthread_create(pthread_t *, const pthread_attr_t *,
 #undef malloc
 #undef free
 #undef recv
+#undef send
 #ifdef _WIN32
 #undef setsockopt
 #undef ioctlsocket
@@ -141,6 +145,14 @@ static unsigned int failed_client_allocations, failed_client_threads;
 static socket_t accepted_client = INVALID_FD, failed_client = INVALID_FD;
 static void *failed_client_argument;
 static int check_client_rollback;
+static int short_tcp_io;
+/* Each client worker has its own schedule and counters, including its greeting. */
+static _Thread_local struct {
+    int enabled;
+    unsigned int sends, receives, short_sends, limited_receives;
+    unsigned int send_interrupts, send_blocks, receive_interrupts, receive_blocks;
+    uint64_t sent, received;
+} tcp_io;
 /* Only the chosen control socket has a continuously replenished receive queue. */
 static socket_t continuous_control = INVALID_FD;
 static unsigned int continuous_reads;
@@ -213,6 +225,25 @@ static int fail_client_thread(void *argument) {
 }
 
 #ifdef _WIN32
+static DWORD WINAPI short_io_client_thread(LPVOID argument) {
+    tcp_io.enabled = 1;
+    DWORD result = client_thread(argument);
+#else
+static void *short_io_client_thread(void *argument) {
+    tcp_io.enabled = 1;
+    void *result = client_thread(argument);
+#endif
+    fprintf(stderr, "Fault TCP IO: sent=%llu received=%llu short_sends=%u limited_receives=%u "
+                    "send_interrupts=%u send_blocks=%u receive_interrupts=%u receive_blocks=%u\n",
+            (unsigned long long)tcp_io.sent, (unsigned long long)tcp_io.received,
+            tcp_io.short_sends, tcp_io.limited_receives,
+            tcp_io.send_interrupts, tcp_io.send_blocks,
+            tcp_io.receive_interrupts, tcp_io.receive_blocks);
+    fflush(stderr);
+    return result;
+}
+
+#ifdef _WIN32
 static HANDLE injected_create_event(LPSECURITY_ATTRIBUTES attributes, BOOL manual_reset,
                                      BOOL initial_state, LPCSTR name) {
     if (resolver_setup_failure == 2) return NULL;
@@ -229,6 +260,7 @@ static HANDLE injected_create_thread(LPSECURITY_ATTRIBUTES attributes, SIZE_T st
         return NULL;
     }
     if (resolver_setup_failure == 3 && start == resolver_thread) return NULL;
+    if (short_tcp_io && start == client_thread) start = short_io_client_thread;
     return CreateThread(attributes, stack_size, start, argument, flags, thread_id);
 }
 
@@ -264,6 +296,7 @@ static int injected_pthread_create(pthread_t *thread, const pthread_attr_t *attr
                                     void *(*start)(void *), void *argument) {
     if (start == client_thread && fail_client_thread(argument)) return EAGAIN;
     if (resolver_setup_failure == 3 && start == resolver_thread) return EAGAIN;
+    if (short_tcp_io && start == client_thread) start = short_io_client_thread;
     return pthread_create(thread, attributes, start, argument);
 }
 #endif
@@ -281,6 +314,36 @@ static int injected_recv(SOCKET fd, char *buffer, int length, int flags) {
 #else
 static ssize_t injected_recv(int fd, void *buffer, size_t length, int flags) {
 #endif
+    if (tcp_io.enabled && !flags) {
+        ++tcp_io.receives;
+        if (tcp_io.receives % 17 == 0) {
+            ++tcp_io.receive_interrupts;
+#ifdef _WIN32
+            set_test_error(WSAEINTR);
+#else
+            set_test_error(EINTR);
+#endif
+            return -1;
+        }
+        if (tcp_io.receives % 19 == 0) {
+            ++tcp_io.receive_blocks;
+#ifdef _WIN32
+            set_test_error(WSAEWOULDBLOCK);
+#else
+            set_test_error(EAGAIN);
+#endif
+            return -1;
+        }
+        static const size_t limits[] = {8191, 4093, 6151};
+        size_t limited = limits[tcp_io.receives % 3];
+        if (limited > (size_t)length) limited = (size_t)length;
+        int n = (int)recv(fd, buffer, (int)limited, flags);
+        if (n > 0) {
+            tcp_io.received += (unsigned int)n;
+            if (limited < (size_t)length) ++tcp_io.limited_receives;
+        }
+        return n;
+    }
     if (fd != continuous_control) return recv(fd, buffer, length, flags);
     if (!(flags & MSG_PEEK)) {
         ++continuous_reads;
@@ -288,6 +351,42 @@ static ssize_t injected_recv(int fd, void *buffer, size_t length, int flags) {
     }
     memset(buffer, 'c', (size_t)length);
     return length;
+}
+
+#ifdef _WIN32
+static int injected_send(SOCKET fd, const char *buffer, int length, int flags) {
+#else
+static ssize_t injected_send(int fd, const void *buffer, size_t length, int flags) {
+#endif
+    if (!tcp_io.enabled) return send(fd, buffer, length, flags);
+    ++tcp_io.sends;
+    if (tcp_io.sends % 17 == 0) {
+        ++tcp_io.send_interrupts;
+#ifdef _WIN32
+        set_test_error(WSAEINTR);
+#else
+        set_test_error(EINTR);
+#endif
+        return -1;
+    }
+    if (tcp_io.sends % 19 == 0) {
+        ++tcp_io.send_blocks;
+#ifdef _WIN32
+        set_test_error(WSAEWOULDBLOCK);
+#else
+        set_test_error(EAGAIN);
+#endif
+        return -1;
+    }
+    static const size_t limits[] = {257, 1021, 509};
+    size_t limited = limits[tcp_io.sends % 3];
+    if (limited > (size_t)length) limited = (size_t)length;
+    int n = (int)send(fd, buffer, (int)limited, flags);
+    if (n > 0) {
+        tcp_io.sent += (unsigned int)n;
+        if ((size_t)n < (size_t)length) ++tcp_io.short_sends;
+    }
+    return n;
 }
 
 #ifdef _WIN32
@@ -1800,8 +1899,10 @@ static void test_connection_fallback(void) {
 }
 
 int main(int argc, char **argv) {
-    if (argc > 1 && !strcmp(argv[1], "--fail-client-setup")) {
-        fail_client_setup = 1;
+    if (argc > 1 && (!strcmp(argv[1], "--fail-client-setup") ||
+                    !strcmp(argv[1], "--short-tcp-io"))) {
+        fail_client_setup = !strcmp(argv[1], "--fail-client-setup");
+        short_tcp_io = !strcmp(argv[1], "--short-tcp-io");
         --argc;
         for (int i = 1; i < argc; ++i) argv[i] = argv[i + 1];
         argv[argc] = NULL;
