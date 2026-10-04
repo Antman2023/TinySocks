@@ -146,6 +146,71 @@ class CommandLineTests(unittest.TestCase):
 
 
 class ProxyTests(ProxyTestCase):
+    numeric_domains = (
+        ("127.0.0.1", socket.AF_INET, "127.0.0.1", 1),
+        ("::1", socket.AF_INET6, "::1", 4),
+        ("::ffff:127.0.0.1", socket.AF_INET, "127.0.0.1", 1),
+    )
+
+    def numeric_tcp_round_trip(self, host, family, bind_host, reply_type):
+        with socket.socket(family) as listener:
+            try:
+                listener.bind((bind_host, 0))
+            except OSError:
+                if family == socket.AF_INET6:
+                    self.skipTest("IPv6 loopback is unavailable")
+                raise
+            listener.listen()
+            listener.settimeout(2)
+            with self.control() as control:
+                control.settimeout(0.7)
+                control.sendall(b"\x05\x01\x00" + encode_address(
+                    host, listener.getsockname()[1], domain=True) + b"numeric request")
+                control.shutdown(socket.SHUT_WR)
+                self.assertEqual(read_reply(control)[0], bytes([5, 0, 0, reply_type]))
+                with listener.accept()[0] as target:
+                    target.settimeout(2)
+                    self.assertEqual(recv_exact(target, 15), b"numeric request")
+                    self.assertEqual(target.recv(1), b"")
+                    target.sendall(b"numeric reply")
+                    target.shutdown(socket.SHUT_WR)
+                    self.assertEqual(recv_exact(control, 13), b"numeric reply")
+                    self.assert_closed(control)
+
+    def numeric_udp_round_trip(self, host, family, bind_host, reply_type):
+        with self.control() as control, \
+             socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client, \
+             socket.socket(family, socket.SOCK_DGRAM) as target:
+            try:
+                target.bind((bind_host, 0))
+            except OSError:
+                if family == socket.AF_INET6:
+                    self.skipTest("IPv6 loopback is unavailable")
+                raise
+            relay = self.associate(control)
+            request = b"\x00\x00\x00" + encode_address(
+                host, target.getsockname()[1], domain=True) + b"numeric payload"
+            client.sendto(request, relay)
+            target.settimeout(0.7)
+            payload, outbound = target.recvfrom(100)
+            self.assertEqual(payload, b"numeric payload")
+            target.sendto(payload, outbound)
+            client.settimeout(2)
+            expected = b"\x00\x00\x00" + encode_address(
+                bind_host, target.getsockname()[1]) + payload
+            self.assertEqual(expected[3], reply_type)
+            self.assertEqual(client.recvfrom(100)[0], expected)
+
+    def test_tcp_numeric_domain_and_half_close(self):
+        for case in self.numeric_domains:
+            with self.subTest(host=case[0]):
+                self.numeric_tcp_round_trip(*case)
+
+    def test_udp_numeric_domain(self):
+        for case in self.numeric_domains:
+            with self.subTest(host=case[0]):
+                self.numeric_udp_round_trip(*case)
+
     def test_authentication_rejection(self):
         with socket.create_connection(("127.0.0.1", self.port), 2) as control:
             control.sendall(b"\x05\x01\x02")
@@ -688,6 +753,28 @@ class ProxyTests(ProxyTestCase):
 @unittest.skipUnless(FAULTS_ENABLED, "requires the fault-injection binary (--faults)")
 class FaultProxyTests(ProxyTestCase):
     """Checks requiring the resolver and socket failures in test_faults.c."""
+
+    def occupy_resolver_slots(self):
+        with self.control() as first, self.control() as second:
+            for control in (first, second):
+                control.sendall(b"\x05\x01\x00" + encode_address("held.test", 9, domain=True))
+            for control in (first, second):
+                self.assertEqual(read_reply(control)[0][:3], b"\x05\x04\x00")
+                self.assert_closed(control)
+        # Let client threads finish; the held resolver workers retain both slots.
+        time.sleep(0.05)
+
+    def test_tcp_numeric_domain_with_dns_slots_full(self):
+        self.occupy_resolver_slots()
+        for case in ProxyTests.numeric_domains:
+            with self.subTest(host=case[0]):
+                ProxyTests.numeric_tcp_round_trip(self, *case)
+
+    def test_udp_numeric_domain_with_dns_slots_full(self):
+        self.occupy_resolver_slots()
+        for case in ProxyTests.numeric_domains:
+            with self.subTest(host=case[0]):
+                ProxyTests.numeric_udp_round_trip(self, *case)
 
     def test_udp_control_close_during_dns_drops_datagram(self):
         for ignored_data in (b"", b"ignored" * 8192):

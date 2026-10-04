@@ -730,6 +730,31 @@ static void normalize_ipv4_mapped(struct sockaddr_storage *address) {
     }
 }
 
+/* Convert standard IP literals without changing the system's legacy/scoped parsing. */
+static int parse_numeric_host(const char *host, struct sockaddr_storage *address) {
+    const char *dotted = strrchr(host, ':');
+    dotted = dotted ? dotted + 1 : host;
+    if (strchr(dotted, '.'))
+        for (const char *p = dotted; *p; ++p)
+            if ((p == dotted || p[-1] == '.') && *p == '0' &&
+                p[1] >= '0' && p[1] <= '9') return 0;
+    struct sockaddr_in ipv4 = {0};
+    struct sockaddr_in6 ipv6 = {0};
+    if (inet_pton(AF_INET, host, &ipv4.sin_addr) == 1) {
+        ipv4.sin_family = AF_INET;
+        memset(address, 0, sizeof(*address));
+        memcpy(address, &ipv4, sizeof(ipv4));
+        return 1;
+    }
+    if (inet_pton(AF_INET6, host, &ipv6.sin6_addr) == 1) {
+        ipv6.sin6_family = AF_INET6;
+        memset(address, 0, sizeof(*address));
+        memcpy(address, &ipv6, sizeof(ipv6));
+        return 1;
+    }
+    return 0;
+}
+
 static socklen_t address_length(const struct sockaddr_storage *address) {
     return (socklen_t)(address->ss_family == AF_INET ? sizeof(struct sockaddr_in) :
                        sizeof(struct sockaddr_in6));
@@ -869,7 +894,7 @@ static int forward_udp_request(const unsigned char *packet, size_t length,
     }
     unsigned short target_port = (unsigned short)(packet[offset] << 8 | packet[offset + 1]);
     offset += 2;
-    if (packet[3] != 3) {
+    if (packet[3] != 3 || parse_numeric_host(host, &destination)) {
         /* Numeric addresses already contain everything needed by sendto. */
         set_address_port(&destination, target_port);
         return send_udp_request(packet + offset, length - offset, &destination,
@@ -1092,6 +1117,7 @@ static void handle_client(socket_t client) {
         if (!recv_all(client, (unsigned char *)host, length, deadline_ms)) goto done;
         if (memchr(host, '\0', length) != NULL) goto done;
         host[length] = '\0';
+        parse_numeric_host(host, &address);
     } else {
         send_reply(client, 8, INVALID_FD); /* Address type not supported. */
         goto done;
@@ -1105,7 +1131,7 @@ static void handle_client(socket_t client) {
     }
 
     unsigned char status;
-    if (header[3] == 3) {
+    if (header[3] == 3 && address.ss_family == AF_UNSPEC) {
         snprintf(port, sizeof(port), "%u", (unsigned)target_port);
         target = connect_target(host, port, NULL, &status);
     } else {

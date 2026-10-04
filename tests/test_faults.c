@@ -405,6 +405,30 @@ static void test_dns_cache(void) {
     struct udp_dns_entry cache[UDP_DNS_CACHE_LIMIT] = {{0}};
     fake_dns = 1;
 
+    const char *fallback_hosts[] = {
+        "127.1", "2130706433", "0177.0.0.1", "0x7f.0.0.1", "127.000.000.001",
+        "::ffff:127.0.0.01", "[::1]", "fe80::1%1", "localhost", "", "127.0.0.256"
+    };
+    struct sockaddr_storage untouched, parsed;
+    memset(&untouched, 0xa5, sizeof(untouched));
+    for (unsigned int i = 0; i < sizeof(fallback_hosts) / sizeof(fallback_hosts[0]); ++i) {
+        parsed = untouched;
+        assert(!parse_numeric_host(fallback_hosts[i], &parsed));
+        assert(memcmp(&parsed, &untouched, sizeof(parsed)) == 0);
+    }
+    assert(parse_numeric_host("0000:0000:0000:0000:0000:0000:0000:0001", &parsed));
+    const unsigned char loopback[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+    assert(parsed.ss_family == AF_INET6);
+    assert(memcmp(&((struct sockaddr_in6 *)&parsed)->sin6_addr, loopback, 16) == 0);
+    assert(((struct sockaddr_in6 *)&parsed)->sin6_port == 0);
+    assert(((struct sockaddr_in6 *)&parsed)->sin6_scope_id == 0);
+    const char *literals[] = {"127.0.0.1", "::ffff:127.0.0.1", "::FFFF:127.0.0.1"};
+    for (unsigned int i = 0; i < 100; ++i)
+        assert(domain_request(literals[i % 3], port, &ipv4, &ipv6, destinations, cache));
+    assert(resolutions == 0);
+    for (unsigned int i = 0; i < UDP_DNS_CACHE_LIMIT; ++i)
+        assert(cache[i].expires_at_ms == 0);
+
     assert(domain_request("cached.test", port, &ipv4, &ipv6, destinations, cache));
     uint64_t expiry = cached_entry(cache, "cached.test")->expires_at_ms;
     for (int i = 1; i < 100; ++i)
@@ -451,6 +475,9 @@ static void test_dns_cache(void) {
     unsigned int before = resolutions;
     assert(domain_request("cached.test", port, &ipv4, &ipv6, destinations, cache));
     assert(resolutions == before + 1); /* The bounded cache evicted this host. */
+    before = resolutions;
+    assert(domain_request("127.1", port, &ipv4, &ipv6, destinations, cache));
+    assert(resolutions == before + 1); /* Legacy forms still use the system resolver. */
 
     close_socket(target);
     close_socket(second);
@@ -798,7 +825,7 @@ static void test_connection_fallback(void) {
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--test-internals")) {
         test_dns_cache();
-        puts("UDP DNS cache checks passed (100 packets, one resolution).");
+        puts("UDP DNS checks passed (100 literal packets, zero resolutions; cached names, one resolution).");
         test_connection_fallback();
         test_resolver_deadline_and_limit();
         test_resolver_control_close();
