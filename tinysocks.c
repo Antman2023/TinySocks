@@ -45,6 +45,7 @@ typedef int socket_t;
 #define UDP_DNS_CACHE_TTL_SECONDS 60
 #define CONNECT_FALLBACK_DELAY_MS 250
 #define CONNECT_PENDING_LIMIT 8
+#define TCP_CLIENT_CHECK_INTERVAL_MS 50
 
 #ifndef MAX_CLIENTS
 #define MAX_CLIENTS 64
@@ -214,7 +215,7 @@ static int wait_for_io(socket_t fd, short events, uint64_t deadline_ms) {
 
 /* UDP control bytes are ignored; use a separate buffer from the pending datagram. */
 static int udp_control_open(socket_t client, uint64_t deadline_ms) {
-    if (client == INVALID_FD) return 1; /* TCP CONNECT permits a send-side half-close. */
+    if (client == INVALID_FD) return 1;
     char ignored[1024];
     while (remaining_milliseconds(deadline_ms)) {
         int count = recv(client, ignored, sizeof(ignored), 0);
@@ -226,6 +227,36 @@ static int udp_control_open(socket_t client, uint64_t deadline_ms) {
         }
     }
     return 0;
+}
+
+/* FIN is valid for CONNECT, and queued payload belongs to the relay. Some
+   providers expose resets only through recv, even while SO_ERROR remains zero. */
+static int tcp_client_open(socket_t client) {
+    if (client == INVALID_FD) return 1;
+    for (;;) {
+        int error = 0;
+        socklen_t length = (socklen_t)sizeof(error);
+        if (getsockopt(client, SOL_SOCKET, SO_ERROR, (char *)&error, &length) == 0) {
+            if (error) return 0;
+            break;
+        }
+        if (!interrupted(socket_error())) return 0;
+    }
+    char pending;
+    for (;;) {
+        int count = recv(client, &pending, 1, MSG_PEEK);
+        if (count >= 0) return 1; /* Data and EOF are both preserved for relay. */
+        int error = socket_error();
+        if (!interrupted(error)) return would_block(error);
+    }
+}
+
+enum resolver_control_mode { RESOLVE_TCP, RESOLVE_UDP };
+
+static int resolver_control_open(socket_t control, enum resolver_control_mode mode,
+                                  uint64_t deadline_ms) {
+    return mode == RESOLVE_UDP ? udp_control_open(control, deadline_ms)
+                               : tcp_client_open(control);
 }
 
 struct resolver_job {
@@ -280,22 +311,32 @@ static void *resolver_thread(void *argument) {
 #endif
 }
 
-static int wait_for_resolver(struct resolver_job *job, socket_t udp_control,
-                               uint64_t deadline_ms) {
+static int wait_for_resolver(struct resolver_job *job, socket_t control,
+                               enum resolver_control_mode mode, uint64_t deadline_ms) {
 #ifdef _WIN32
-    if (udp_control == INVALID_FD)
-        return WaitForSingleObject(job->ready, (DWORD)remaining_milliseconds(deadline_ms)) ==
-               WAIT_OBJECT_0;
+    if (mode == RESOLVE_TCP || control == INVALID_FD) {
+        for (;;) {
+            int remaining_ms = remaining_milliseconds(deadline_ms);
+            if (!remaining_ms || !tcp_client_open(control)) return 0;
+            /* Close notifications can wait behind unread data or an earlier FIN.
+               Bound checks so queued data/EOF cannot cause a readiness spin. */
+            if (control != INVALID_FD && remaining_ms > TCP_CLIENT_CHECK_INTERVAL_MS)
+                remaining_ms = TCP_CLIENT_CHECK_INTERVAL_MS;
+            DWORD ready = WaitForSingleObject(job->ready, (DWORD)remaining_ms);
+            if (ready == WAIT_OBJECT_0) return 1;
+            if (ready != WAIT_TIMEOUT) return 0;
+        }
+    }
     WSAEVENT control_ready = WSACreateEvent();
     if (control_ready == WSA_INVALID_EVENT) return 0;
-    if (WSAEventSelect(udp_control, control_ready, FD_READ | FD_CLOSE) != 0) {
+    if (WSAEventSelect(control, control_ready, FD_READ | FD_CLOSE) != 0) {
         WSACloseEvent(control_ready);
         return 0;
     }
     HANDLE events[2] = {job->ready, control_ready};
     int completed = 0;
     for (;;) {
-        if (!udp_control_open(udp_control, deadline_ms)) break;
+        if (!udp_control_open(control, deadline_ms)) break;
         int remaining_ms = remaining_milliseconds(deadline_ms);
         if (!remaining_ms) break;
         DWORD ready = WaitForMultipleObjects(2, events, FALSE, (DWORD)remaining_ms);
@@ -305,26 +346,31 @@ static int wait_for_resolver(struct resolver_job *job, socket_t udp_control,
         }
         if (ready != WAIT_OBJECT_0 + 1) break;
         WSANETWORKEVENTS network;
-        if (WSAEnumNetworkEvents(udp_control, control_ready, &network) != 0 ||
+        if (WSAEnumNetworkEvents(control, control_ready, &network) != 0 ||
             (network.lNetworkEvents & FD_CLOSE)) break;
     }
     /* Stop socket notifications before releasing their event handle. */
-    WSAEventSelect(udp_control, NULL, 0);
+    WSAEventSelect(control, NULL, 0);
     WSACloseEvent(control_ready);
     return completed;
 #else
     for (;;) {
-        if (!udp_control_open(udp_control, deadline_ms)) return 0;
+        if (!resolver_control_open(control, mode, deadline_ms)) return 0;
         int remaining_ms = remaining_milliseconds(deadline_ms);
         if (!remaining_ms) return 0;
-        pollfd_t pending[2] = {{job->ready[0], POLLIN, 0}, {udp_control, POLLIN, 0}};
-        unsigned int count = udp_control == INVALID_FD ? 1 : 2;
+        int udp = mode == RESOLVE_UDP && control != INVALID_FD;
+        if (mode == RESOLVE_TCP && control != INVALID_FD &&
+            remaining_ms > TCP_CLIENT_CHECK_INTERVAL_MS)
+            remaining_ms = TCP_CLIENT_CHECK_INTERVAL_MS;
+        pollfd_t pending[2] = {{job->ready[0], POLLIN, 0}, {control, POLLIN, 0}};
+        unsigned int count = udp ? 2 : 1;
         int ready = poll_sockets(pending, count, remaining_ms);
         if (ready < 0 && interrupted(socket_error())) continue;
-        if (ready <= 0) return 0;
+        if (ready < 0) return 0;
+        if (ready == 0) continue;
         /* A simultaneous close takes priority over a completed DNS result. */
         if (count == 2 && pending[1].revents &&
-            !udp_control_open(udp_control, deadline_ms)) return 0;
+            !udp_control_open(control, deadline_ms)) return 0;
         if (pending[0].revents) return (pending[0].revents & POLLIN) != 0;
     }
 #endif
@@ -332,15 +378,30 @@ static int wait_for_resolver(struct resolver_job *job, socket_t udp_control,
 
 static int resolve_target(const char *host, const char *port, const struct addrinfo *hints,
                            struct addrinfo **addresses, uint64_t deadline_ms,
-                           socket_t udp_control) {
+                           socket_t control, enum resolver_control_mode mode) {
     *addresses = NULL;
     if (strlen(host) >= 256 || strlen(port) >= 6) return EAI_NONAME;
     /* Queue callers within their existing budget instead of rejecting DNS bursts. */
+    uint64_t next_tcp_check_ms = 0;
     for (;;) {
         int remaining_ms = remaining_milliseconds(deadline_ms);
-        if (!remaining_ms || !udp_control_open(udp_control, deadline_ms)) return EAI_AGAIN;
+        if (!remaining_ms) return EAI_AGAIN;
+        if (mode == RESOLVE_UDP) {
+            if (!udp_control_open(control, deadline_ms)) return EAI_AGAIN;
+        } else if (control != INVALID_FD) {
+            uint64_t now = monotonic_milliseconds();
+            if (now >= next_tcp_check_ms) {
+                if (!tcp_client_open(control)) return EAI_AGAIN;
+                next_tcp_check_ms = now + TCP_CLIENT_CHECK_INTERVAL_MS;
+            }
+        }
         if (reserve_slot(&active_resolvers, MAX_RESOLVERS)) break;
         retry_pause(remaining_ms < 5 ? remaining_ms : 5);
+    }
+    /* A newly available slot is not permission to start work for a reset client. */
+    if (!resolver_control_open(control, mode, deadline_ms)) {
+        atomic_fetch_sub_explicit(&active_resolvers, 1, memory_order_relaxed);
+        return EAI_AGAIN;
     }
     struct resolver_job *job = calloc(1, sizeof(*job));
     if (!job) {
@@ -381,9 +442,9 @@ static int resolve_target(const char *host, const char *port, const struct addri
         goto failed;
     }
 #endif
-    int completed = wait_for_resolver(job, udp_control, deadline_ms);
+    int completed = wait_for_resolver(job, control, mode, deadline_ms);
     int result = EAI_AGAIN;
-    if (completed && udp_control_open(udp_control, deadline_ms) &&
+    if (completed && resolver_control_open(control, mode, deadline_ms) &&
         atomic_load_explicit(&job->completed, memory_order_acquire) &&
         job->completed_at_ms <= deadline_ms) {
         result = job->error;
@@ -499,7 +560,7 @@ static struct addrinfo *next_connect_address(struct addrinfo **cursor, int famil
 
 static socket_t connect_target(const char *host, const char *port,
                                const struct sockaddr_storage *numeric,
-                               unsigned char *status) {
+                               unsigned char *status, socket_t client) {
     struct addrinfo hints;
     struct addrinfo *addresses = NULL;
     struct addrinfo numeric_address = {0};
@@ -507,6 +568,10 @@ static socket_t connect_target(const char *host, const char *port,
     socket_t result = INVALID_FD;
     /* Resolution and all connection attempts share this deadline. */
     uint64_t deadline_ms = monotonic_milliseconds() + CONNECT_TIMEOUT_SECONDS * 1000;
+    if (!tcp_client_open(client)) {
+        *status = 4;
+        return INVALID_FD;
+    }
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -518,7 +583,8 @@ static socket_t connect_target(const char *host, const char *port,
         numeric_address.ai_addr = (struct sockaddr *)&numeric_endpoint;
         numeric_address.ai_addrlen = address_length(&numeric_endpoint);
         addresses = &numeric_address;
-    } else if (resolve_target(host, port, &hints, &addresses, deadline_ms, INVALID_FD) != 0) {
+    } else if (resolve_target(host, port, &hints, &addresses, deadline_ms,
+                              client, RESOLVE_TCP) != 0) {
         *status = 4; /* Host unreachable. */
         return INVALID_FD;
     }
@@ -542,7 +608,7 @@ static socket_t connect_target(const char *host, const char *port,
     pollfd_t pending[CONNECT_PENDING_LIMIT];
     unsigned int count = 0;
     while (cursors[0] || cursors[1] || count) {
-        if (!remaining_milliseconds(deadline_ms)) {
+        if (!remaining_milliseconds(deadline_ms) || !tcp_client_open(client)) {
             *status = 4;
             break;
         }
@@ -598,11 +664,17 @@ static socket_t connect_target(const char *host, const char *port,
             int delay_ms = remaining_milliseconds(next_start_ms);
             if (delay_ms < timeout_ms) timeout_ms = delay_ms;
         }
+        if (client != INVALID_FD && timeout_ms > TCP_CLIENT_CHECK_INTERVAL_MS)
+            timeout_ms = TCP_CLIENT_CHECK_INTERVAL_MS;
         int ready = wait_for_connect(pending, count, timeout_ms);
         if (ready < 0) {
             int error = socket_error();
             if (interrupted(error)) continue;
             *status = connect_error_status(error);
+            break;
+        }
+        if (ready > 0 && !tcp_client_open(client)) {
+            *status = 4;
             break;
         }
         for (unsigned int i = 0; i < count && ready > 0;) {
@@ -627,6 +699,11 @@ static socket_t connect_target(const char *host, const char *port,
     }
 connected:
     for (unsigned int i = 0; i < count; ++i) close_socket(pending[i].fd);
+    if (result != INVALID_FD && !tcp_client_open(client)) {
+        close_socket(result);
+        result = INVALID_FD;
+        *status = 4;
+    }
     if (result != INVALID_FD) *status = 0;
     if (!numeric) freeaddrinfo(addresses);
     return result;
@@ -960,7 +1037,8 @@ static int forward_udp_request(const unsigned char *packet, size_t length,
     hints.ai_flags = AI_NUMERICSERV;
     uint64_t dns_deadline_ms = monotonic_milliseconds() + CONNECT_TIMEOUT_SECONDS * 1000;
     if (deadline_ms < dns_deadline_ms) dns_deadline_ms = deadline_ms;
-    int error = resolve_target(host, port, &hints, &addresses, dns_deadline_ms, udp_control);
+    int error = resolve_target(host, port, &hints, &addresses, dns_deadline_ms,
+                               udp_control, RESOLVE_UDP);
     if (!udp_control_open(udp_control, deadline_ms)) {
         if (addresses) freeaddrinfo(addresses);
         return -1; /* End the association before processing queued UDP replies. */
@@ -1169,10 +1247,10 @@ static void handle_client(socket_t client) {
     unsigned char status;
     if (header[3] == 3 && address.ss_family == AF_UNSPEC) {
         snprintf(port, sizeof(port), "%u", (unsigned)target_port);
-        target = connect_target(host, port, NULL, &status);
+        target = connect_target(host, port, NULL, &status, client);
     } else {
         set_address_port(&address, target_port);
-        target = connect_target(NULL, NULL, &address, &status);
+        target = connect_target(NULL, NULL, &address, &status, client);
     }
     if (!send_reply(client, status, target)) goto done;
     if (target == INVALID_FD) goto done;

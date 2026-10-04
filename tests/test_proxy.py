@@ -1,6 +1,7 @@
 """Protocol checks; --release skips checks needing shortened build-time limits."""
 
 import random
+import select
 import socket
 import struct
 import subprocess
@@ -8,6 +9,7 @@ import sys
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from pathlib import Path
 
 
@@ -547,7 +549,44 @@ class ProxyTests(ProxyTestCase):
                     target.sendto(data, outbound)
                     self.assertEqual(client.recvfrom(65536)[0], header + payload)
 
-    def test_udp_domain_cache_keeps_destination_ports_separate(self):
+    def test_udp_domain_case_variants_and_destination_ports(self):
+        with ExitStack() as stack:
+            control = stack.enter_context(self.control())
+            client = stack.enter_context(socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
+            client.settimeout(2)
+            relay = self.associate(control)
+            targets = []
+            for _ in range(2):
+                ipv4 = stack.enter_context(socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
+                ipv4.bind(("127.0.0.1", 0))
+                port = ipv4.getsockname()[1]
+                families = [ipv4]
+                try:
+                    ipv6 = stack.enter_context(socket.socket(socket.AF_INET6, socket.SOCK_DGRAM))
+                    ipv6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                    ipv6.bind(("::1", port))
+                    families.append(ipv6)
+                except OSError:
+                    pass
+                targets.append((port, families))
+            all_targets = [sock for _, families in targets for sock in families]
+            for host in ("localhost", "LoCaLhOsT", "LOCALHOST", "localhost"):
+                for port, families in targets:
+                    with self.subTest(host=host, port=port):
+                        payload = host.encode("ascii") + struct.pack("!H", port)
+                        client.sendto(b"\x00\x00\x00" + encode_address(
+                            host, port, domain=True) + payload, relay)
+                        ready, _, _ = select.select(all_targets, [], [], 2)
+                        self.assertTrue(ready, "localhost UDP request was not delivered")
+                        self.assertIn(ready[0], families, "request reached the wrong destination port")
+                        data, outbound = ready[0].recvfrom(100)
+                        self.assertEqual(data, payload)
+                        ready[0].sendto(data, outbound)
+                        address = ready[0].getsockname()
+                        self.assertEqual(client.recvfrom(100)[0], b"\x00\x00\x00" +
+                                         encode_address(address[0], address[1]) + payload)
+
+    def test_udp_numeric_domain_keeps_destination_ports_separate(self):
         with self.control() as control, \
              socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client, \
              socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as first, \
@@ -754,6 +793,89 @@ class ProxyTests(ProxyTestCase):
 class FaultProxyTests(ProxyTestCase):
     """Checks requiring the resolver and socket failures in test_faults.c."""
 
+    def reset_control(self, control):
+        linger = struct.pack("HH" if sys.platform == "win32" else "ii", 1, 0)
+        control.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, linger)
+        control.close()
+
+    def wait_for_held_dns(self):
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            try:
+                lines = pool.submit(lambda: [self.proxy.stderr.readline().strip()
+                                             for _ in range(2)]).result(timeout=2)
+            except BaseException:
+                self.stop_proxy()  # Unblock a pending diagnostic read before joining.
+                raise
+        self.assertEqual(set(lines), {"Fault DNS held: 0", "Fault DNS held: 1"})
+
+    def assert_service_after_reset(self):
+        deadline = time.monotonic() + 0.4
+        while time.monotonic() < deadline:
+            candidate = None
+            try:
+                candidate = socket.create_connection(("127.0.0.1", self.port), 0.1)
+                candidate.settimeout(0.1)
+                candidate.sendall(GREETING)
+                self.assertEqual(recv_exact(candidate, 2), b"\x05\x00")
+                control = candidate
+                break
+            except (OSError, EOFError):
+                if candidate is not None:
+                    candidate.close()
+                time.sleep(0.01)
+        else:
+            self.fail("reset clients retained client slots during DNS waiting")
+        with control, socket.socket() as target:
+            target.bind(("127.0.0.1", 0))
+            target.listen()
+            target.settimeout(1)
+            control.settimeout(1)
+            control.sendall(b"\x05\x01\x00" + encode_address(*target.getsockname()) + b"available")
+            self.assertEqual(read_reply(control)[0][:3], b"\x05\x00\x00")
+            with target.accept()[0] as received:
+                received.settimeout(1)
+                self.assertEqual(recv_exact(received, 9), b"available")
+                received.sendall(b"reply")
+                self.assertEqual(recv_exact(control, 5), b"reply")
+
+    def test_tcp_reset_during_dns_releases_client_slots(self):
+        with self.control() as first, self.control() as second:
+            request = b"\x05\x01\x00" + encode_address("reset.test", 9, domain=True)
+            first.sendall(request)
+            second.sendall(request + b"pending payload" * 2048)
+            self.wait_for_held_dns()  # Both system resolvers are blocked before RST.
+            time.sleep(0.05)
+            self.reset_control(first)
+            self.reset_control(second)
+        self.assert_service_after_reset()
+
+    def test_tcp_reset_while_dns_slots_full_releases_client_slots(self):
+        self.occupy_resolver_slots()
+        with self.control() as first, self.control() as second:
+            request = b"\x05\x01\x00" + encode_address("delayed.test", 9, domain=True)
+            first.sendall(request)
+            second.sendall(request + b"pending payload" * 2048)
+            time.sleep(0.1)
+            self.reset_control(first)
+            self.reset_control(second)
+        self.assert_service_after_reset()
+
+    def test_tcp_reset_during_dns_does_not_connect_late(self):
+        for payload in (b"", b"pending payload" * 2048):
+            with self.subTest(payload_bytes=len(payload)), socket.socket() as target:
+                target.bind(("127.0.0.1", 0))
+                target.listen()
+                with self.control() as control:
+                    control.sendall(b"\x05\x01\x00" + encode_address(
+                        "delayed.test", target.getsockname()[1], domain=True) + payload)
+                    time.sleep(0.1)
+                    self.reset_control(control)
+                # DNS returns at 600 ms, still within the one-second budget.
+                target.settimeout(0.8)
+                with self.assertRaises(socket.timeout):
+                    with target.accept()[0]:
+                        pass
+
     def occupy_resolver_slots(self):
         with self.control() as first, self.control() as second:
             for control in (first, second):
@@ -867,23 +989,24 @@ class FaultProxyTests(ProxyTestCase):
                              encode_address(*target.getsockname()) + payload)
 
     def test_tcp_domain_half_close_during_dns(self):
-        with socket.socket() as listener:
-            listener.bind(("127.0.0.1", 0))
-            listener.listen()
-            listener.settimeout(2)
-            with self.control() as control:
-                control.sendall(b"\x05\x01\x00" + encode_address(
-                    "delayed.test", listener.getsockname()[1], domain=True) + b"before FIN")
-                control.shutdown(socket.SHUT_WR)
-                self.assertEqual(read_reply(control)[0][:3], b"\x05\x00\x00")
-                with listener.accept()[0] as target:
-                    target.settimeout(2)
-                    self.assertEqual(recv_exact(target, 10), b"before FIN")
-                    self.assertEqual(target.recv(1), b"")
-                    target.sendall(b"after FIN")
-                    target.shutdown(socket.SHUT_WR)
-                    self.assertEqual(recv_exact(control, 9), b"after FIN")
-                    self.assert_closed(control)
+        for payload in (b"before FIN", b"pending payload" * 2048):
+            with self.subTest(payload_bytes=len(payload)), socket.socket() as listener:
+                listener.bind(("127.0.0.1", 0))
+                listener.listen()
+                listener.settimeout(2)
+                with self.control() as control:
+                    control.sendall(b"\x05\x01\x00" + encode_address(
+                        "delayed.test", listener.getsockname()[1], domain=True) + payload)
+                    control.shutdown(socket.SHUT_WR)
+                    self.assertEqual(read_reply(control)[0][:3], b"\x05\x00\x00")
+                    with listener.accept()[0] as target:
+                        target.settimeout(2)
+                        self.assertEqual(recv_exact(target, len(payload)), payload)
+                        self.assertEqual(target.recv(1), b"")
+                        target.sendall(b"after FIN")
+                        target.shutdown(socket.SHUT_WR)
+                        self.assertEqual(recv_exact(control, 9), b"after FIN")
+                        self.assert_closed(control)
 
     def test_slow_dns_respects_connection_deadline(self):
         with socket.socket() as listener, self.control() as control:
