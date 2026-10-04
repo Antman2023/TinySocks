@@ -758,9 +758,9 @@ class ProxyTests(ProxyTestCase):
                              b"\x00\x00\x00" + encode_address(*target.getsockname()))
 
     def large_udp_round_trip(self, family, host):
+        client_family = socket.AF_INET6 if ":" in self.listen_host else socket.AF_INET
         with self.control() as control, \
-             socket.socket(socket.AF_INET6 if ":" in self.listen_host else socket.AF_INET,
-                           socket.SOCK_DGRAM) as client, \
+             socket.socket(client_family, socket.SOCK_DGRAM) as client, \
              socket.socket(family, socket.SOCK_DGRAM) as target:
             relay = self.associate(control)
             try:
@@ -775,8 +775,11 @@ class ProxyTests(ProxyTestCase):
             target.settimeout(2)
             client.settimeout(2)
             header = b"\x00\x00\x00" + encode_address(host, target.getsockname()[1])
-            # 65,485 bytes plus the largest SOCKS header fits IPv4's UDP limit.
-            for size in (0, 8192, 16384, 49152, 65485):
+            # Encapsulation and the target's IP family impose separate limits.
+            client_limit = 65507 if client_family == socket.AF_INET else 65527
+            target_limit = 65507 if family == socket.AF_INET else 65527
+            payload_limit = min(target_limit, client_limit - len(header))
+            for size in (0, 8192, 16384, 49152, payload_limit):
                 payload = random.Random(size).getrandbits(size * 8).to_bytes(size, "little")
                 with self.subTest(size=size, target_family=family):
                     client.sendto(header + payload, relay)
