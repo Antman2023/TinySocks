@@ -212,6 +212,22 @@ static int wait_for_io(socket_t fd, short events, uint64_t deadline_ms) {
     }
 }
 
+/* UDP control bytes are ignored; use a separate buffer from the pending datagram. */
+static int udp_control_open(socket_t client, uint64_t deadline_ms) {
+    if (client == INVALID_FD) return 1; /* TCP CONNECT permits a send-side half-close. */
+    char ignored[1024];
+    while (remaining_milliseconds(deadline_ms)) {
+        int count = recv(client, ignored, sizeof(ignored), 0);
+        if (count == 0) return 0;
+        if (count < 0) {
+            int error = socket_error();
+            if (interrupted(error)) continue;
+            return would_block(error);
+        }
+    }
+    return 0;
+}
+
 struct resolver_job {
     char host[256], port[6];
     struct addrinfo hints, *addresses;
@@ -264,14 +280,65 @@ static void *resolver_thread(void *argument) {
 #endif
 }
 
+static int wait_for_resolver(struct resolver_job *job, socket_t udp_control,
+                               uint64_t deadline_ms) {
+#ifdef _WIN32
+    if (udp_control == INVALID_FD)
+        return WaitForSingleObject(job->ready, (DWORD)remaining_milliseconds(deadline_ms)) ==
+               WAIT_OBJECT_0;
+    WSAEVENT control_ready = WSACreateEvent();
+    if (control_ready == WSA_INVALID_EVENT) return 0;
+    if (WSAEventSelect(udp_control, control_ready, FD_READ | FD_CLOSE) != 0) {
+        WSACloseEvent(control_ready);
+        return 0;
+    }
+    HANDLE events[2] = {job->ready, control_ready};
+    int completed = 0;
+    for (;;) {
+        if (!udp_control_open(udp_control, deadline_ms)) break;
+        int remaining_ms = remaining_milliseconds(deadline_ms);
+        if (!remaining_ms) break;
+        DWORD ready = WaitForMultipleObjects(2, events, FALSE, (DWORD)remaining_ms);
+        if (ready == WAIT_OBJECT_0) {
+            completed = 1;
+            break;
+        }
+        if (ready != WAIT_OBJECT_0 + 1) break;
+        WSANETWORKEVENTS network;
+        if (WSAEnumNetworkEvents(udp_control, control_ready, &network) != 0 ||
+            (network.lNetworkEvents & FD_CLOSE)) break;
+    }
+    /* Stop socket notifications before releasing their event handle. */
+    WSAEventSelect(udp_control, NULL, 0);
+    WSACloseEvent(control_ready);
+    return completed;
+#else
+    for (;;) {
+        if (!udp_control_open(udp_control, deadline_ms)) return 0;
+        int remaining_ms = remaining_milliseconds(deadline_ms);
+        if (!remaining_ms) return 0;
+        pollfd_t pending[2] = {{job->ready[0], POLLIN, 0}, {udp_control, POLLIN, 0}};
+        unsigned int count = udp_control == INVALID_FD ? 1 : 2;
+        int ready = poll_sockets(pending, count, remaining_ms);
+        if (ready < 0 && interrupted(socket_error())) continue;
+        if (ready <= 0) return 0;
+        /* A simultaneous close takes priority over a completed DNS result. */
+        if (count == 2 && pending[1].revents &&
+            !udp_control_open(udp_control, deadline_ms)) return 0;
+        if (pending[0].revents) return (pending[0].revents & POLLIN) != 0;
+    }
+#endif
+}
+
 static int resolve_target(const char *host, const char *port, const struct addrinfo *hints,
-                           struct addrinfo **addresses, uint64_t deadline_ms) {
+                           struct addrinfo **addresses, uint64_t deadline_ms,
+                           socket_t udp_control) {
     *addresses = NULL;
     if (strlen(host) >= 256 || strlen(port) >= 6) return EAI_NONAME;
     /* Queue callers within their existing budget instead of rejecting DNS bursts. */
     for (;;) {
         int remaining_ms = remaining_milliseconds(deadline_ms);
-        if (!remaining_ms) return EAI_AGAIN;
+        if (!remaining_ms || !udp_control_open(udp_control, deadline_ms)) return EAI_AGAIN;
         if (reserve_slot(&active_resolvers, MAX_RESOLVERS)) break;
         retry_pause(remaining_ms < 5 ? remaining_ms : 5);
     }
@@ -295,7 +362,6 @@ static int resolve_target(const char *host, const char *port, const struct addri
         goto failed;
     }
     CloseHandle(thread);
-    WaitForSingleObject(job->ready, (DWORD)remaining_milliseconds(deadline_ms));
 #else
     job->ready[0] = job->ready[1] = -1;
     if (pipe(job->ready) != 0 ||
@@ -314,10 +380,11 @@ static int resolve_target(const char *host, const char *port, const struct addri
         atomic_store_explicit(&job->references, 1, memory_order_relaxed);
         goto failed;
     }
-    wait_for_io(job->ready[0], POLLIN, deadline_ms);
 #endif
+    int completed = wait_for_resolver(job, udp_control, deadline_ms);
     int result = EAI_AGAIN;
-    if (atomic_load_explicit(&job->completed, memory_order_acquire) &&
+    if (completed && udp_control_open(udp_control, deadline_ms) &&
+        atomic_load_explicit(&job->completed, memory_order_acquire) &&
         job->completed_at_ms <= deadline_ms) {
         result = job->error;
         if (!result) {
@@ -451,7 +518,7 @@ static socket_t connect_target(const char *host, const char *port,
         numeric_address.ai_addr = (struct sockaddr *)&numeric_endpoint;
         numeric_address.ai_addrlen = address_length(&numeric_endpoint);
         addresses = &numeric_address;
-    } else if (resolve_target(host, port, &hints, &addresses, deadline_ms) != 0) {
+    } else if (resolve_target(host, port, &hints, &addresses, deadline_ms, INVALID_FD) != 0) {
         *status = 4; /* Host unreachable. */
         return INVALID_FD;
     }
@@ -770,7 +837,8 @@ static int send_udp_request(const unsigned char *payload, size_t length,
 static int forward_udp_request(const unsigned char *packet, size_t length,
                                 socket_t *ipv4, socket_t *ipv6,
                                 struct udp_destination *destinations,
-                                struct udp_dns_entry *dns_cache, uint64_t deadline_ms) {
+                                struct udp_dns_entry *dns_cache, uint64_t deadline_ms,
+                                socket_t udp_control) {
     char host[256], port[6];
     struct sockaddr_storage destination;
     memset(&destination, 0, sizeof(destination));
@@ -831,7 +899,12 @@ static int forward_udp_request(const unsigned char *packet, size_t length,
     hints.ai_flags = AI_NUMERICSERV;
     uint64_t dns_deadline_ms = monotonic_milliseconds() + CONNECT_TIMEOUT_SECONDS * 1000;
     if (deadline_ms < dns_deadline_ms) dns_deadline_ms = deadline_ms;
-    if (resolve_target(host, port, &hints, &addresses, dns_deadline_ms) != 0) return 0;
+    int error = resolve_target(host, port, &hints, &addresses, dns_deadline_ms, udp_control);
+    if (!udp_control_open(udp_control, deadline_ms)) {
+        if (addresses) freeaddrinfo(addresses);
+        return -1; /* End the association before processing queued UDP replies. */
+    }
+    if (error) return 0;
     int forwarded = 0;
     for (struct addrinfo *address = addresses; address; address = address->ai_next) {
         if (!remaining_milliseconds(deadline_ms)) break;
@@ -954,8 +1027,11 @@ static void udp_associate(socket_t client, unsigned short requested_port) {
                 if (same_ip(&peer, &source) &&
                     (!requested_port || address_port(&source) == requested_port) &&
                     (!client_known || address_port(&source) == address_port(&udp_client))) {
-                    if (forward_udp_request(packet, (size_t)count, &ipv4, &ipv6,
-                                            destinations, dns_cache, deadline_ms)) {
+                    int forwarded = forward_udp_request(packet, (size_t)count, &ipv4, &ipv6,
+                                                          destinations, dns_cache,
+                                                          deadline_ms, client);
+                    if (forwarded < 0) break;
+                    if (forwarded) {
                         udp_client = source;
                         client_known = 1;
                         deadline_ms = monotonic_milliseconds() + IDLE_TIMEOUT_SECONDS * 1000;

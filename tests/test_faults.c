@@ -32,6 +32,8 @@ static int injected_select(int, fd_set *, fd_set *, fd_set *, const struct timev
 static HANDLE injected_create_event(LPSECURITY_ATTRIBUTES, BOOL, BOOL, LPCSTR);
 static HANDLE injected_create_thread(LPSECURITY_ATTRIBUTES, SIZE_T, LPTHREAD_START_ROUTINE,
                                       LPVOID, DWORD, LPDWORD);
+static WSAEVENT injected_wsa_create_event(void);
+static int injected_wsa_event_select(SOCKET, WSAEVENT, long);
 #else
 static int injected_accept(int, struct sockaddr *, socklen_t *);
 static int injected_connect(int, const struct sockaddr *, socklen_t);
@@ -55,6 +57,8 @@ static int injected_pthread_create(pthread_t *, const pthread_attr_t *,
 #define CreateThread injected_create_thread
 #define closesocket injected_close
 #define select injected_select
+#define WSACreateEvent injected_wsa_create_event
+#define WSAEventSelect injected_wsa_event_select
 #else
 #define close injected_close
 #define poll injected_poll
@@ -75,6 +79,8 @@ static int injected_pthread_create(pthread_t *, const pthread_attr_t *,
 #undef CreateThread
 #undef closesocket
 #undef select
+#undef WSACreateEvent
+#undef WSAEventSelect
 #else
 #undef close
 #undef poll
@@ -99,6 +105,7 @@ static _Atomic(struct addrinfo *) held_results[MAX_RESOLVERS];
 static int resolver_setup_failure;
 #ifdef _WIN32
 static HANDLE failed_resolver_event;
+static WSAEVENT failed_control_event;
 #else
 static int failed_resolver_pipe[2];
 #endif
@@ -122,6 +129,21 @@ static HANDLE injected_create_thread(LPSECURITY_ATTRIBUTES attributes, SIZE_T st
                                       DWORD flags, LPDWORD thread_id) {
     if (resolver_setup_failure == 3 && start == resolver_thread) return NULL;
     return CreateThread(attributes, stack_size, start, argument, flags, thread_id);
+}
+
+static WSAEVENT injected_wsa_create_event(void) {
+    if (resolver_setup_failure == 4) return WSA_INVALID_EVENT;
+    WSAEVENT event = WSACreateEvent();
+    if (resolver_setup_failure == 5) failed_control_event = event;
+    return event;
+}
+
+static int injected_wsa_event_select(SOCKET client, WSAEVENT event, long events) {
+    if (resolver_setup_failure == 5 && events) {
+        WSASetLastError(WSAENOBUFS);
+        return SOCKET_ERROR;
+    }
+    return WSAEventSelect(client, event, events);
 }
 #else
 static int injected_pipe(int *fds) {
@@ -180,6 +202,10 @@ static int injected_getaddrinfo(const char *host, const char *port,
     }
     if (!strcmp(host, "slow.test")) {
         retry_pause(2000);
+        return getaddrinfo("127.0.0.1", port, hints, result);
+    }
+    if (!strcmp(host, "delayed.test")) {
+        retry_pause(600);
         return getaddrinfo("127.0.0.1", port, hints, result);
     }
     if (fake_connect && !strcmp(host, "fallback.test")) {
@@ -341,7 +367,8 @@ static int domain_request(const char *host, unsigned short port, socket_t *ipv4,
     packet[5 + length] = (unsigned char)(port >> 8);
     packet[6 + length] = (unsigned char)port;
     return forward_udp_request(packet, length + 7, ipv4, ipv6, destinations, cache,
-                                monotonic_milliseconds() + CONNECT_TIMEOUT_SECONDS * 1000);
+                                monotonic_milliseconds() + CONNECT_TIMEOUT_SECONDS * 1000,
+                                INVALID_FD);
 }
 
 static struct udp_dns_entry *cached_entry(struct udp_dns_entry *cache, const char *host) {
@@ -447,6 +474,145 @@ static void wait_for_resolvers(void) {
     }
 }
 
+static void reset_held_dns(void) {
+    wait_for_resolvers();
+    atomic_store_explicit(&held_dns_calls, 0, memory_order_relaxed);
+    atomic_store_explicit(&held_dns_freed, 0, memory_order_relaxed);
+    atomic_store_explicit(&release_held_dns, 0, memory_order_relaxed);
+    for (unsigned int i = 0; i < MAX_RESOLVERS; ++i)
+        assert(atomic_load_explicit(&held_results[i], memory_order_relaxed) == NULL);
+}
+
+static void control_pair(socket_t pair[2]) {
+    socket_t listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    assert(listener != INVALID_FD);
+    struct sockaddr_in local = {0};
+    local.sin_family = AF_INET;
+    local.sin_addr.s_addr = htonl(TEST_LOOPBACK_IP);
+    assert(bind(listener, (struct sockaddr *)&local, sizeof(local)) == 0);
+    assert(listen(listener, 1) == 0);
+    socklen_t length = sizeof(local);
+    assert(getsockname(listener, (struct sockaddr *)&local, &length) == 0);
+    pair[1] = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    assert(pair[1] != INVALID_FD);
+    assert(connect(pair[1], (struct sockaddr *)&local, sizeof(local)) == 0);
+    pair[0] = accept(listener, NULL, NULL);
+    assert(pair[0] != INVALID_FD && set_nonblocking(pair[0], 1));
+    close_socket(listener);
+}
+
+struct control_closer {
+    socket_t peer;
+    unsigned int dns_calls;
+};
+
+#ifdef _WIN32
+static DWORD WINAPI close_control_thread(LPVOID argument) {
+#else
+static void *close_control_thread(void *argument) {
+#endif
+    struct control_closer *closer = argument;
+    uint64_t deadline_ms = monotonic_milliseconds() + 1000;
+    while (atomic_load_explicit(&held_dns_calls, memory_order_acquire) < closer->dns_calls) {
+        assert(remaining_milliseconds(deadline_ms));
+        retry_pause(1);
+    }
+    retry_pause(50);
+    unsigned char ignored[4096] = {0};
+    assert(send_all(closer->peer, ignored, sizeof(ignored), deadline_ms));
+#ifdef _WIN32
+    assert(shutdown(closer->peer, SD_SEND) == 0);
+    return 0;
+#else
+    assert(shutdown(closer->peer, SHUT_WR) == 0);
+    return NULL;
+#endif
+}
+
+static void test_resolver_control_close(void) {
+#ifdef _WIN32
+    WSADATA winsock;
+    assert(WSAStartup(MAKEWORD(2, 2), &winsock) == 0);
+#endif
+    struct addrinfo hints = {0}, *addresses = NULL;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_flags = AI_NUMERICSERV;
+    socket_t control[2];
+    reset_held_dns();
+    control_pair(control);
+    close_socket(control[1]);
+    assert(wait_for_io(control[0], POLLIN, monotonic_milliseconds() + 1000));
+    assert(resolve_target("held.test", "80", &hints, &addresses,
+                          monotonic_milliseconds() + 1000, control[0]) == EAI_AGAIN);
+    assert(addresses == NULL && atomic_load_explicit(&active_resolvers, memory_order_acquire) == 0);
+    assert(atomic_load_explicit(&held_dns_calls, memory_order_relaxed) == 0);
+    close_socket(control[0]);
+
+    for (int queued = 0; queued <= 1; ++queued) {
+        reset_held_dns();
+        if (queued)
+            for (unsigned int i = 0; i < MAX_RESOLVERS; ++i)
+                assert(resolve_target("held.test", "80", &hints, &addresses,
+                                      monotonic_milliseconds() + 20, INVALID_FD) == EAI_AGAIN);
+        unsigned int expected_jobs = queued ? MAX_RESOLVERS : 1;
+        control_pair(control);
+        struct control_closer closer = {control[1], expected_jobs};
+#ifdef _WIN32
+        HANDLE thread = CreateThread(NULL, 0, close_control_thread, &closer, 0, NULL);
+        assert(thread != NULL);
+#else
+        pthread_t thread;
+        assert(pthread_create(&thread, NULL, close_control_thread, &closer) == 0);
+#endif
+        uint64_t start = monotonic_milliseconds();
+        assert(resolve_target(queued ? "127.0.0.1" : "held.test", "80", &hints, &addresses,
+                              start + 1000, control[0]) == EAI_AGAIN);
+        assert(addresses == NULL && monotonic_milliseconds() - start < 500);
+#ifdef _WIN32
+        assert(WaitForSingleObject(thread, 1000) == WAIT_OBJECT_0);
+        CloseHandle(thread);
+#else
+        assert(pthread_join(thread, NULL) == 0);
+#endif
+        /* Cancelling a caller does not free the still-running resolver's slot. */
+        assert(atomic_load_explicit(&active_resolvers, memory_order_acquire) == expected_jobs);
+        assert(atomic_load_explicit(&held_dns_calls, memory_order_relaxed) == expected_jobs);
+        assert(atomic_load_explicit(&held_dns_freed, memory_order_relaxed) == 0);
+        atomic_store_explicit(&release_held_dns, 1, memory_order_release);
+        wait_for_resolvers();
+        assert(atomic_load_explicit(&held_dns_freed, memory_order_relaxed) == expected_jobs);
+        close_socket(control[0]);
+        close_socket(control[1]);
+    }
+#ifdef _WIN32
+    for (int failure = 4; failure <= 5; ++failure) {
+        reset_held_dns();
+        control_pair(control);
+        resolver_setup_failure = failure;
+        assert(resolve_target("held.test", "80", &hints, &addresses,
+                              monotonic_milliseconds() + 1000, control[0]) == EAI_AGAIN);
+        assert(addresses == NULL);
+        if (failure == 5) {
+            assert(failed_control_event != WSA_INVALID_EVENT);
+            assert(WaitForSingleObject(failed_control_event, 0) == WAIT_FAILED);
+        }
+        resolver_setup_failure = 0;
+        atomic_store_explicit(&release_held_dns, 1, memory_order_release);
+        wait_for_resolvers();
+        assert(atomic_load_explicit(&held_dns_freed, memory_order_relaxed) == 1);
+        assert(resolve_target("127.0.0.1", "80", &hints, &addresses,
+                              monotonic_milliseconds() + 1000, control[0]) == 0);
+        freeaddrinfo(addresses);
+        wait_for_resolvers();
+        close_socket(control[0]);
+        close_socket(control[1]);
+    }
+    WSACleanup();
+#endif
+    puts("UDP control checks passed (closed, resolving, queued, late cleanup, recovery).");
+}
+
 #ifdef _WIN32
 static DWORD WINAPI release_dns_thread(LPVOID argument) {
 #else
@@ -474,12 +640,13 @@ static void test_resolver_deadline_and_limit(void) {
     hints.ai_flags = AI_NUMERICSERV;
     for (unsigned int i = 0; i < MAX_RESOLVERS; ++i) {
         assert(resolve_target("held.test", "80", &hints, &addresses,
-                              monotonic_milliseconds() + 50) == EAI_AGAIN);
+                              monotonic_milliseconds() + 50, INVALID_FD) == EAI_AGAIN);
         assert(addresses == NULL);
     }
     assert(atomic_load_explicit(&active_resolvers, memory_order_acquire) == MAX_RESOLVERS);
     uint64_t start = monotonic_milliseconds();
-    assert(resolve_target("held.test", "80", &hints, &addresses, start + 50) == EAI_AGAIN);
+    assert(resolve_target("held.test", "80", &hints, &addresses,
+                          start + 50, INVALID_FD) == EAI_AGAIN);
     assert(monotonic_milliseconds() - start >= 40 && monotonic_milliseconds() - start < 250);
 #ifdef _WIN32
     HANDLE releaser = CreateThread(NULL, 0, release_dns_thread, NULL, 0, NULL);
@@ -491,7 +658,7 @@ static void test_resolver_deadline_and_limit(void) {
     /* A caller queued at capacity succeeds when earlier timed-out jobs finish. */
     start = monotonic_milliseconds();
     assert(resolve_target("127.0.0.1", "80", &hints, &addresses,
-                          start + 1000) == 0);
+                          start + 1000, INVALID_FD) == 0);
     assert(monotonic_milliseconds() - start >= 40);
     assert(addresses != NULL);
     freeaddrinfo(addresses);
@@ -501,7 +668,7 @@ static void test_resolver_deadline_and_limit(void) {
     for (int failure = 1; failure <= 3; ++failure) {
         resolver_setup_failure = failure;
         int error = resolve_target("127.0.0.1", "80", &hints, &addresses,
-                                    monotonic_milliseconds() + 1000);
+                                    monotonic_milliseconds() + 1000, INVALID_FD);
         assert(error == (failure == 1 ? EAI_MEMORY : EAI_AGAIN));
         assert(addresses == NULL);
         assert(atomic_load_explicit(&active_resolvers, memory_order_acquire) == 0);
@@ -518,7 +685,7 @@ static void test_resolver_deadline_and_limit(void) {
         }
         resolver_setup_failure = 0;
         assert(resolve_target("127.0.0.1", "80", &hints, &addresses,
-                              monotonic_milliseconds() + 1000) == 0);
+                              monotonic_milliseconds() + 1000, INVALID_FD) == 0);
         freeaddrinfo(addresses);
         wait_for_resolvers();
     }
@@ -634,6 +801,7 @@ int main(int argc, char **argv) {
         puts("UDP DNS cache checks passed (100 packets, one resolution).");
         test_connection_fallback();
         test_resolver_deadline_and_limit();
+        test_resolver_control_close();
         return 0;
     }
     return tinysocks_main(argc, argv);

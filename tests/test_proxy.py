@@ -689,6 +689,80 @@ class ProxyTests(ProxyTestCase):
 class FaultProxyTests(ProxyTestCase):
     """Checks requiring the resolver and socket failures in test_faults.c."""
 
+    def test_udp_control_close_during_dns_drops_datagram(self):
+        for ignored_data in (b"", b"ignored" * 8192):
+            with self.subTest(control_bytes=len(ignored_data)), self.control() as control, \
+                 socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client, \
+                 socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as target:
+                relay = self.associate(control)
+                target.bind(("127.0.0.1", 0))
+                request = b"\x00\x00\x00" + encode_address(
+                    "delayed.test", target.getsockname()[1], domain=True) + b"cancelled"
+                client.sendto(request, relay)
+                time.sleep(0.1)
+                if ignored_data:
+                    control.sendall(ignored_data)
+                control.close()
+                # This lookup finishes within the DNS budget; closure must cancel it.
+                target.settimeout(1.1)
+                with self.assertRaises(socket.timeout):
+                    target.recvfrom(100)
+
+    def test_udp_control_half_close_during_dns_is_prompt(self):
+        with self.control() as control, \
+             socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client, \
+             socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as target:
+            relay = self.associate(control)
+            target.bind(("127.0.0.1", 0))
+            client.sendto(b"\x00\x00\x00" + encode_address(
+                "slow.test", target.getsockname()[1], domain=True) + b"cancelled", relay)
+            time.sleep(0.1)
+            control.shutdown(socket.SHUT_WR)
+            control.settimeout(0.4)
+            self.assert_closed(control)
+            # Keep the destination open beyond the cancelled worker's completion.
+            target.settimeout(2.1)
+            with self.assertRaises(socket.timeout):
+                target.recvfrom(100)
+
+    def test_udp_control_data_during_dns_preserves_payload(self):
+        with self.control() as control, \
+             socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client, \
+             socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as target:
+            relay = self.associate(control)
+            target.bind(("127.0.0.1", 0))
+            request = b"\x00\x00\x00" + encode_address(
+                "delayed.test", target.getsockname()[1], domain=True) + b"original payload"
+            client.sendto(request, relay)
+            time.sleep(0.1)
+            control.sendall(b"ignored control data" * 4096)
+            target.settimeout(1.5)
+            payload, outbound = target.recvfrom(100)
+            self.assertEqual(payload, b"original payload")
+            target.sendto(payload, outbound)
+            client.settimeout(2)
+            self.assertEqual(client.recvfrom(100)[0], b"\x00\x00\x00" +
+                             encode_address(*target.getsockname()) + payload)
+
+    def test_tcp_domain_half_close_during_dns(self):
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            listener.settimeout(2)
+            with self.control() as control:
+                control.sendall(b"\x05\x01\x00" + encode_address(
+                    "delayed.test", listener.getsockname()[1], domain=True) + b"before FIN")
+                control.shutdown(socket.SHUT_WR)
+                self.assertEqual(read_reply(control)[0][:3], b"\x05\x00\x00")
+                with listener.accept()[0] as target:
+                    target.settimeout(2)
+                    self.assertEqual(recv_exact(target, 10), b"before FIN")
+                    self.assertEqual(target.recv(1), b"")
+                    target.sendall(b"after FIN")
+                    target.shutdown(socket.SHUT_WR)
+                    self.assertEqual(recv_exact(control, 9), b"after FIN")
+                    self.assert_closed(control)
+
     def test_slow_dns_respects_connection_deadline(self):
         with socket.socket() as listener, self.control() as control:
             listener.bind(("127.0.0.1", 0))
