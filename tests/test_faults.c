@@ -156,6 +156,8 @@ static int resolver_entry_delay;
 static unsigned int resolver_entry_advance_seconds;
 static atomic_int resolver_entry_started = ATOMIC_VAR_INIT(0);
 static atomic_uint resolver_entry_calls = ATOMIC_VAR_INIT(0);
+static atomic_int resolver_entry_release = ATOMIC_VAR_INIT(1);
+static int resolver_entry_close_action, resolver_entry_keep_blocked;
 /* Private CLI mode: only the accept thread owns these failure-phase fields. */
 static int fail_client_setup;
 static unsigned int failed_client_allocations, failed_client_threads;
@@ -299,7 +301,17 @@ static void *delayed_resolver_entry(void *argument) {
     atomic_store_explicit(&clock_advance_seconds, resolver_entry_advance_seconds,
                            memory_order_relaxed);
     atomic_store_explicit(&resolver_entry_started, 1, memory_order_release);
+    while (!atomic_load_explicit(&resolver_entry_release, memory_order_acquire)) retry_pause(1);
     return resolver_thread(argument);
+}
+
+static void finish_resolver_creation(void) {
+    if (!resolver_entry_close_action) return;
+    resolver_setup_action = resolver_entry_close_action;
+    finish_resolver_setup();
+    resolver_setup_action = 0;
+    if (!resolver_entry_keep_blocked)
+        atomic_store_explicit(&resolver_entry_release, 1, memory_order_release);
 }
 
 #ifdef _WIN32
@@ -325,9 +337,12 @@ static HANDLE injected_create_thread(LPSECURITY_ATTRIBUTES attributes, SIZE_T st
     }
     if (resolver_setup_failure == 3 && start == resolver_thread) return NULL;
     if (resolver_setup_action && start == resolver_thread) ++resolver_setup_starts;
-    if (resolver_entry_delay && start == resolver_thread) start = delayed_resolver_entry;
+    int delayed = resolver_entry_delay && start == resolver_thread;
+    if (delayed) start = delayed_resolver_entry;
     if (short_tcp_io && start == client_thread) start = short_io_client_thread;
-    return CreateThread(attributes, stack_size, start, argument, flags, thread_id);
+    HANDLE thread = CreateThread(attributes, stack_size, start, argument, flags, thread_id);
+    if (thread && delayed) finish_resolver_creation();
+    return thread;
 }
 
 static WSAEVENT injected_wsa_create_event(void) {
@@ -364,9 +379,12 @@ static int injected_pthread_create(pthread_t *thread, const pthread_attr_t *attr
     if (start == client_thread && fail_client_thread(argument)) return EAGAIN;
     if (resolver_setup_failure == 3 && start == resolver_thread) return EAGAIN;
     if (resolver_setup_action && start == resolver_thread) ++resolver_setup_starts;
-    if (resolver_entry_delay && start == resolver_thread) start = delayed_resolver_entry;
+    int delayed = resolver_entry_delay && start == resolver_thread;
+    if (delayed) start = delayed_resolver_entry;
     if (short_tcp_io && start == client_thread) start = short_io_client_thread;
-    return pthread_create(thread, attributes, start, argument);
+    int result = pthread_create(thread, attributes, start, argument);
+    if (!result && delayed) finish_resolver_creation();
+    return result;
 }
 #endif
 
@@ -1724,7 +1742,11 @@ static void test_resolver_control_close(void) {
         resolver_setup_failure = 0;
         atomic_store_explicit(&release_held_dns, 1, memory_order_release);
         wait_for_resolvers();
-        assert(atomic_load_explicit(&held_dns_freed, memory_order_relaxed) == 1);
+        /* Event setup can fail before the worker enters the resolver. Only
+           workers that actually started need to free a late DNS result. */
+        unsigned int calls = atomic_load_explicit(&held_dns_calls, memory_order_relaxed);
+        assert(calls <= 1);
+        assert(atomic_load_explicit(&held_dns_freed, memory_order_relaxed) == calls);
         assert(resolve_target("127.0.0.1", "80", &hints, &addresses,
                               monotonic_milliseconds() + 1000, control[0], RESOLVE_UDP) == 0);
         freeaddrinfo(addresses);
@@ -1958,6 +1980,103 @@ static void test_resolver_delayed_entry(void) {
     WSACleanup();
 #endif
     puts("Resolver entry checks passed (original budget, expired worker skips resolver, valid worker resolves, cleanup, recovery).");
+}
+
+static void test_resolver_abandoned_entry(void) {
+#ifdef _WIN32
+    WSADATA winsock;
+    assert(WSAStartup(MAKEWORD(2, 2), &winsock) == 0);
+#endif
+    const struct { enum resolver_control_mode mode; int action, abandoned; } cases[] = {
+        {RESOLVE_TCP, 3, 1}, {RESOLVE_UDP, 2, 1},
+        {RESOLVE_TCP, 2, 0}, {RESOLVE_TCP, 4, 0}
+    };
+    struct addrinfo hints = {0};
+    hints.ai_family = AF_INET;
+    hints.ai_flags = AI_NUMERICSERV;
+    for (unsigned int i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        reset_held_dns();
+        socket_t control[2], replacement[2] = {INVALID_FD, INVALID_FD};
+        control_pair(control);
+        socket_t old_control = control[0];
+        resolver_setup_control = control[0];
+        resolver_setup_peer = control[1];
+        resolver_entry_delay = 1;
+        resolver_entry_advance_seconds = 0; /* The original budget remains valid. */
+        resolver_entry_close_action = cases[i].action;
+        resolver_entry_keep_blocked = cases[i].abandoned;
+        atomic_store_explicit(&resolver_entry_started, 0, memory_order_relaxed);
+        atomic_store_explicit(&resolver_entry_calls, 0, memory_order_relaxed);
+        atomic_store_explicit(&resolver_entry_release, 0, memory_order_relaxed);
+        hints.ai_socktype = cases[i].mode == RESOLVE_TCP ? SOCK_STREAM : SOCK_DGRAM;
+        uint64_t deadline_ms = monotonic_milliseconds() + 5000;
+        struct addrinfo *addresses = NULL;
+        int error = resolve_target(cases[i].abandoned ? "held.test" : "127.0.0.1", "80",
+                                    &hints, &addresses, deadline_ms, control[0], cases[i].mode);
+        assert(remaining_milliseconds(deadline_ms));
+        if (cases[i].abandoned) {
+            assert(error == EAI_AGAIN && addresses == NULL);
+            assert(atomic_load_explicit(&active_resolvers, memory_order_acquire) == 1);
+            assert(atomic_load_explicit(&resolver_entry_calls, memory_order_relaxed) == 0);
+            /* The worker's remaining reference must be enough: close the caller
+               socket and keep a new healthy connection open before it resumes. */
+            close_socket(control[0]);
+            control[0] = INVALID_FD;
+            control_pair(replacement);
+        }
+        atomic_store_explicit(&release_held_dns, 1, memory_order_release);
+        atomic_store_explicit(&resolver_entry_release, 1, memory_order_release);
+        wait_for_resolvers();
+        unsigned int calls = atomic_load_explicit(&resolver_entry_calls, memory_order_relaxed);
+        resolver_entry_delay = resolver_entry_close_action = resolver_entry_keep_blocked = 0;
+        printf("Resolver abandoned entry: mode=%d action=%d abandoned=%d calls=%u reused=%d\n",
+               cases[i].mode, cases[i].action, cases[i].abandoned, calls,
+               old_control == replacement[0] || old_control == replacement[1]);
+        fflush(stdout);
+        if (cases[i].abandoned) {
+            assert(calls == 0);
+            assert(atomic_load_explicit(&held_dns_calls, memory_order_relaxed) == 0);
+        } else {
+            assert(error == 0 && addresses != NULL && calls == 1);
+            freeaddrinfo(addresses);
+            if (cases[i].action == 4) {
+                char payload[sizeof(resolver_setup_payload)];
+                assert(recv_all(control[0], (unsigned char *)payload,
+                                 sizeof(resolver_setup_payload) - 1,
+                                 monotonic_milliseconds() + 1000));
+                assert(!memcmp(payload, resolver_setup_payload, sizeof(resolver_setup_payload) - 1));
+            }
+            assert(wait_for_io(control[0], POLLIN, monotonic_milliseconds() + 1000));
+            char eof;
+            assert(recv(control[0], &eof, 1, 0) == 0);
+        }
+        assert(resolver_setup_job == NULL);
+#ifdef _WIN32
+        assert(WaitForSingleObject(failed_resolver_event, 0) == WAIT_FAILED);
+        assert(GetLastError() == ERROR_INVALID_HANDLE);
+#else
+        for (int j = 0; j < 2; ++j) {
+            assert(fcntl(failed_resolver_pipe[j], F_GETFD) == -1);
+            assert(errno == EBADF);
+        }
+#endif
+        if (control[0] != INVALID_FD) close_socket(control[0]);
+        if (resolver_setup_peer != INVALID_FD) close_socket(resolver_setup_peer);
+        if (replacement[0] != INVALID_FD) {
+            close_socket(replacement[0]);
+            close_socket(replacement[1]);
+        }
+        resolver_setup_control = resolver_setup_peer = INVALID_FD;
+        assert(resolve_target("127.0.0.1", "80", &hints, &addresses,
+                              monotonic_milliseconds() + 1000, INVALID_FD, RESOLVE_TCP) == 0);
+        freeaddrinfo(addresses);
+        wait_for_resolvers();
+    }
+    reset_held_dns();
+#ifdef _WIN32
+    WSACleanup();
+#endif
+    puts("Resolver abandonment checks passed (unexpired budget, TCP reset, UDP close, caller socket reuse, TCP FIN/data preserved, notification/job cleanup, recovery).");
 }
 
 static void test_resolver_deadline_and_limit(void) {
@@ -2202,6 +2321,7 @@ int main(int argc, char **argv) {
         test_connection_fallback();
         test_resolver_setup_cancellation();
         test_resolver_delayed_entry();
+        test_resolver_abandoned_entry();
         test_resolver_deadline_and_limit();
         test_resolver_control_close();
         test_resolver_tcp_reset();

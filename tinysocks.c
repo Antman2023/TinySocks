@@ -337,7 +337,7 @@ struct resolver_job {
     int error;
     uint64_t deadline_ms, completed_at_ms;
     atomic_uint references;
-    atomic_int completed;
+    atomic_int completed, cancelled;
 #ifdef _WIN32
     HANDLE ready;
 #else
@@ -363,9 +363,10 @@ static DWORD WINAPI resolver_thread(LPVOID argument) {
 static void *resolver_thread(void *argument) {
 #endif
     struct resolver_job *job = argument;
-    /* A newly created worker may not be scheduled until its caller has expired. */
+    /* A newly created worker may run after its caller expires or stops waiting. */
     job->error = EAI_AGAIN;
-    if (remaining_milliseconds(job->deadline_ms))
+    if (!atomic_load_explicit(&job->cancelled, memory_order_acquire) &&
+        remaining_milliseconds(job->deadline_ms))
         job->error = getaddrinfo(job->host, job->port, &job->hints, &job->addresses);
     job->completed_at_ms = monotonic_milliseconds();
     atomic_store_explicit(&job->completed, 1, memory_order_release);
@@ -485,6 +486,7 @@ static int resolve_target(const char *host, const char *port, const struct addri
     }
     atomic_init(&job->references, 1);
     atomic_init(&job->completed, 0);
+    atomic_init(&job->cancelled, 0);
     strcpy(job->host, host);
     strcpy(job->port, port);
     job->hints = *hints;
@@ -520,6 +522,8 @@ static int resolve_target(const char *host, const char *port, const struct addri
     }
 #endif
     int completed = wait_for_resolver(job, control, mode, deadline_ms);
+    if (!completed)
+        atomic_store_explicit(&job->cancelled, 1, memory_order_release);
     int result = EAI_AGAIN;
     if (completed && resolver_control_open(control, mode, deadline_ms) &&
         atomic_load_explicit(&job->completed, memory_order_acquire) &&
