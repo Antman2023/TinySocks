@@ -410,6 +410,125 @@ class ProxyTests(ProxyTestCase):
                     self.assertEqual(control.recv(1), b"")
                     sender.result(timeout=5)
 
+    def fill_tcp_direction(self, source, destination):
+        source.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 16384)
+        source.setblocking(False)
+        deadline = time.monotonic() + 2
+        blocked_at = None
+        sent = 0
+        while time.monotonic() < deadline:
+            try:
+                sent += source.send(b"x" * 65536)
+                blocked_at = None
+            except BlockingIOError:
+                now = time.monotonic()
+                if blocked_at is None:
+                    blocked_at = now
+                if now - blocked_at >= 0.15:
+                    break
+                select.select([], [source], [], 0.02)
+        else:
+            self.fail("upload did not stall while the receiver stopped reading")
+        self.assertGreater(sent, 16384)
+        # Confirm the relay is still active and its reverse path works.
+        destination.sendall(b"reverse")
+        source.settimeout(0.5)
+        self.assertEqual(recv_exact(source, 7), b"reverse")
+        return sent
+
+    def reset_under_backpressure(self, upstream):
+        with socket.socket() as listener:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            listener.settimeout(2)
+            request = b"\x05\x01\x00" + encode_address(*listener.getsockname())
+            with self.control() as control:
+                control.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+                control.sendall(request)
+                self.assertEqual(read_reply(control)[0][:2], b"\x05\x00")
+                with listener.accept()[0] as target:
+                    target.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+                    source = target if upstream else control
+                    destination = control if upstream else target
+                    self.fill_tcp_direction(source, destination)
+                    with self.control() as other:
+                        other.sendall(request)
+                        self.assertEqual(read_reply(other)[0][:2], b"\x05\x00")
+                        with listener.accept()[0] as held:
+                            held.settimeout(2)
+                            source.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                                              struct.pack("HH" if sys.platform == "win32" else "ii", 1, 0))
+                            source.close()
+                            # Keep the original receiver stalled and the other slot occupied.
+                            deadline = time.monotonic() + 0.4
+                            replacement = None
+                            while time.monotonic() < deadline:
+                                candidate = socket.socket()
+                                candidate.settimeout(max(0.001, deadline - time.monotonic()))
+                                try:
+                                    candidate.connect((self.listen_host, self.port))
+                                    candidate.sendall(GREETING)
+                                    if recv_exact(candidate, 2) == b"\x05\x00":
+                                        replacement = candidate
+                                        self.addCleanup(candidate.close)
+                                        break
+                                except (OSError, EOFError):
+                                    pass
+                                candidate.close()
+                                time.sleep(0.005)
+                            self.assertIsNotNone(replacement, "reset relay retained its client slot")
+                            self.assertLess(time.monotonic(), deadline)
+                            # A live second session rules out its timeout causing recovery.
+                            other.sendall(b"held")
+                            self.assertEqual(recv_exact(held, 4), b"held")
+                            with replacement:
+                                replacement.settimeout(2)
+                                replacement.sendall(request + b"new request")
+                                self.assertEqual(read_reply(replacement)[0][:2], b"\x05\x00")
+                                with listener.accept()[0] as resumed:
+                                    resumed.settimeout(2)
+                                    self.assertEqual(recv_exact(resumed, 11), b"new request")
+                                    resumed.sendall(b"new reply")
+                                    self.assertEqual(recv_exact(replacement, 9), b"new reply")
+
+    @requires_test_limits
+    def test_tcp_client_reset_under_backpressure_releases_slot(self):
+        self.reset_under_backpressure(upstream=False)
+
+    @requires_test_limits
+    def test_tcp_target_reset_under_backpressure_releases_slot(self):
+        self.reset_under_backpressure(upstream=True)
+
+    def test_tcp_half_close_under_backpressure(self):
+        for upstream in (False, True):
+            with self.subTest(upstream=upstream), socket.socket() as listener:
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+                listener.bind(("127.0.0.1", 0))
+                listener.listen()
+                listener.settimeout(2)
+                with self.control() as control:
+                    control.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+                    control.sendall(b"\x05\x01\x00" + encode_address(*listener.getsockname()))
+                    self.assertEqual(read_reply(control)[0][:2], b"\x05\x00")
+                    with listener.accept()[0] as target:
+                        target.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+                        source = target if upstream else control
+                        destination = control if upstream else target
+                        sent = self.fill_tcp_direction(source, destination)
+                        source.shutdown(socket.SHUT_WR)
+                        # Several periodic reset checks must preserve a valid FIN.
+                        time.sleep(0.2)
+                        destination.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
+                        destination.settimeout(3)
+                        self.assertEqual(recv_exact(destination, sent), b"x" * sent)
+                        self.assertEqual(destination.recv(1), b"")
+                        destination.sendall(b"after FIN")
+                        destination.shutdown(socket.SHUT_WR)
+                        source.settimeout(2)
+                        self.assertEqual(recv_exact(source, 9), b"after FIN")
+                        self.assertEqual(source.recv(1), b"")
+
     def test_udp_invalid_packet_does_not_pin_client(self):
         with self.control() as control, \
              socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as rogue, \
