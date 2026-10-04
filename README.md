@@ -81,6 +81,8 @@ tinysocks [监听地址 [端口]]
 
 Windows 监听套接字在绑定前启用 `SO_EXCLUSIVEADDRUSE`，保护监听地址和端口，避免其他本地监听套接字接走该端点的连接；请求独占绑定失败时不会继续使用该套接字。Windows 的通配地址监听也会拒绝在已被其他监听程序占用的端口上启动。Linux 和 macOS 使用 `SO_REUSEADDR` 支持正常重启。绑定规则详见 [Windows 套接字文档](https://learn.microsoft.com/en-us/windows/win32/winsock/using-so-reuseaddr-and-so-exclusiveaddruse)。
 
+macOS 的通配地址与具体地址允许同账户下通过 `SO_REUSEADDR` 重叠绑定，不能据此提供 Windows 的独占保证；需要避免这类端点重叠时，请指定具体监听地址。该行为由 [XNU 的绑定检查](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/netinet/in_pcb.c)决定。
+
 端口必须为 `0` 到 `65535` 的十进制数字；端口 `0` 由系统分配可用端口，例如 `tinysocks 127.0.0.1 0`。启动日志显示实际绑定的数字地址和端口，IPv6 地址使用方括号，如 `[::1]:1080`。使用 `tinysocks --help` 或 `tinysocks -h` 查看用法。
 
 可用 `curl --socks5-hostname 127.0.0.1:1080 http://example.com/` 测试 TCP 转发。TCP 使用非阻塞双向转发，每个方向最多缓存 16 KiB；环形缓冲区避免部分发送后反复搬移数据，接收端变慢时仍可处理反向流量。支持 TCP 半关闭，已接收的数据发送完毕后才向另一端传递 EOF。
@@ -147,4 +149,4 @@ Linux CI 还使用 Clang 的 AddressSanitizer 和 UndefinedBehaviorSanitizer 执
 
 UDP 回复来源检查使用 65 个真实回环目标端口和受控单调时钟，验证未访问端口、过期及容量淘汰的目标回复被丢弃。成功请求可以更新目标许可，回复和发送失败均不能延长许可；刷新已有目标不能挤掉其他目标。允许的回复还须保留来源地址、端口和载荷。这些检查随内部测试在三个系统及 Linux 内存检查任务中执行，无需等待真实的 60 秒期限。
 
-IPv4/IPv6 通配监听回归尝试在相同端口绑定通配及回环地址，分别使用默认选项和 `SO_REUSEADDR`，确认其他监听套接字无法接管该端口；失败尝试后仍须完成真实 TCP 请求、回复和双向半关闭。另验证已有回环监听占用端口时，代理不能作为通配监听启动，并保留原监听正常接入。这些检查也覆盖正式附件和故障程序。
+IPv4/IPv6 通配监听回归分别使用默认选项和 `SO_REUSEADDR`，检查已有监听端点不能被重复监听；失败尝试后仍须完成真实 TCP 请求、回复和双向半关闭。Windows 和 Linux 还检查回环地址不能覆盖通配监听，以及已有回环监听占用端口时代理不能作为通配监听启动。macOS 按系统支持的重复通配端点规则检查，跳过其允许的通配/具体地址复用断言。这些检查也覆盖正式附件和故障程序。

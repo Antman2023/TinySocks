@@ -1226,8 +1226,13 @@ class WildcardListenerTests(ProxyTestCase):
     client_host = "127.0.0.1"
     family = socket.AF_INET
 
-    def test_listener_cannot_be_shadowed(self):
-        for host in (self.listen_host, self.client_host):
+    def test_listener_rejects_conflicting_binds(self):
+        # Darwin permits same-account wildcard/specific overlap with REUSEADDR.
+        # Check duplicate wildcard endpoints there; Windows and Linux also reject
+        # competing specific endpoints. Keep the real relay check on every OS.
+        hosts = (self.listen_host,) if sys.platform == "darwin" else (
+            self.listen_host, self.client_host)
+        for host in hosts:
             for reuse in (False, True):
                 with self.subTest(host=host, reuse=reuse), socket.socket(self.family) as contender:
                     if reuse:
@@ -1262,8 +1267,15 @@ class WildcardListenerTests(ProxyTestCase):
                     self.assertEqual(control.recv(1), b"")
 
     def test_existing_listener_prevents_wildcard_startup(self):
+        self.check_existing_listener(self.listen_host)
+
+    @unittest.skipIf(sys.platform == "darwin", "Darwin permits wildcard/specific port overlap")
+    def test_existing_specific_listener_prevents_wildcard_startup(self):
+        self.check_existing_listener(self.client_host)
+
+    def check_existing_listener(self, bind_host):
         with socket.socket(self.family) as existing:
-            existing.bind((self.client_host, 0))
+            existing.bind((bind_host, 0))
             existing.listen()
             result = subprocess.run(
                 [str(BINARY), self.listen_host, str(existing.getsockname()[1])],
