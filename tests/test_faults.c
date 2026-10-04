@@ -492,7 +492,10 @@ static int injected_poll(struct pollfd *fds, nfds_t count, int timeout) {
     for (nfds_t i = 0; i < count; ++i)
         fds[i].revents = fake_connect == 3 && slow_socket(fds[i].fd) ?
                           POLLOUT : visible[i].revents;
-    return expire_connect_wait(ready + forced);
+    /* DNS notification pipes also use poll; advance only a connection wait. */
+    for (nfds_t i = 0; i < count; ++i)
+        if (fds[i].events & POLLOUT) return expire_connect_wait(ready + forced);
+    return ready + forced;
 }
 #endif
 
