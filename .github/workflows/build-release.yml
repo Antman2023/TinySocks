@@ -28,6 +28,9 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
+          cache-key: stable-lib-v1
+      - name: Keep Zig library paths stable
+        run: ${{ matrix.python }} .github/scripts/stabilize-zig-lib.py
       - name: Test SOCKS5 behavior
         shell: bash
         run: |
@@ -54,6 +57,9 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
+          cache-key: stable-lib-v1
+      - name: Keep Zig library paths stable
+        run: python3 .github/scripts/stabilize-zig-lib.py
 
       - name: Build Linux, Windows, and macOS binaries
         run: |
