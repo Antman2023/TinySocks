@@ -702,6 +702,10 @@ static socket_t connect_target(const char *host, const char *port,
         if (client != INVALID_FD && timeout_ms > TCP_PEER_CHECK_INTERVAL_MS)
             timeout_ms = TCP_PEER_CHECK_INTERVAL_MS;
         int ready = wait_for_connect(pending, count, timeout_ms);
+        if (!remaining_milliseconds(deadline_ms)) {
+            *status = 4;
+            break;
+        }
         if (ready < 0) {
             int error = socket_error();
             if (interrupted(error)) continue;
@@ -734,8 +738,9 @@ static socket_t connect_target(const char *host, const char *port,
     }
 connected:
     for (unsigned int i = 0; i < count; ++i) close_socket(pending[i].fd);
-    if (result != INVALID_FD && !tcp_socket_open(client)) {
-        close_socket(result);
+    if (!remaining_milliseconds(deadline_ms) ||
+        (result != INVALID_FD && !tcp_socket_open(client))) {
+        if (result != INVALID_FD) close_socket(result);
         result = INVALID_FD;
         *status = 4;
     }
@@ -790,6 +795,8 @@ static void relay(socket_t client, socket_t target) {
         int ready = poll_sockets(fds, count, timeout_ms);
         if (ready < 0 && interrupted(socket_error())) continue;
         if (ready < 0) return;
+        /* A ready event cannot revive a session after a delayed wakeup. */
+        if (!remaining_milliseconds(deadline_ms)) return;
         for (int i = 0; i < 2; ++i)
             if ((paused_peers & (1u << i)) && !tcp_socket_open(sockets[i])) return;
         if (!ready) continue; /* Periodic checks do not refresh the idle deadline. */
@@ -1194,7 +1201,7 @@ static void udp_associate(socket_t client, unsigned short requested_port) {
             if (interrupted(socket_error())) continue;
             break;
         }
-        if (ready == 0) break;
+        if (ready == 0 || !remaining_milliseconds(deadline_ms)) break;
         if (readable[0].revents) {
             /* The TCP control connection defines the association lifetime. */
             if (!udp_control_open_buffered(client, deadline_ms, (char *)packet,

@@ -13,6 +13,7 @@
 #include <pthread.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 #endif
 /* Zig's optimized builds define NDEBUG; checks must still execute. */
@@ -32,6 +33,7 @@ static int injected_getsockopt(SOCKET, int, int, char *, int *);
 static int injected_recv(SOCKET, char *, int, int);
 static int injected_ioctlsocket(SOCKET, long, u_long *);
 static int injected_wsa_poll(WSAPOLLFD *, ULONG, INT);
+static ULONGLONG injected_tick_count(void);
 static int injected_select(int, fd_set *, fd_set *, fd_set *, const struct timeval *);
 static HANDLE injected_create_event(LPSECURITY_ATTRIBUTES, BOOL, BOOL, LPCSTR);
 static HANDLE injected_create_thread(LPSECURITY_ATTRIBUTES, SIZE_T, LPTHREAD_START_ROUTINE,
@@ -46,6 +48,7 @@ static int injected_getsockopt(int, int, int, void *, socklen_t *);
 static ssize_t injected_recv(int, void *, size_t, int);
 static int injected_ioctl(int, unsigned long, int *);
 static int injected_poll(struct pollfd *, nfds_t, int);
+static int injected_clock_gettime(clockid_t, struct timespec *);
 static int injected_pipe(int *);
 static int injected_pthread_create(pthread_t *, const pthread_attr_t *,
                                     void *(*)(void *), void *);
@@ -61,6 +64,7 @@ static int injected_pthread_create(pthread_t *, const pthread_attr_t *,
 #ifdef _WIN32
 #define ioctlsocket injected_ioctlsocket
 #define WSAPoll injected_wsa_poll
+#define GetTickCount64 injected_tick_count
 #undef CreateEvent
 #define CreateEvent injected_create_event
 #define CreateThread injected_create_thread
@@ -72,6 +76,7 @@ static int injected_pthread_create(pthread_t *, const pthread_attr_t *,
 #define close injected_close
 #define ioctl injected_ioctl
 #define poll injected_poll
+#define clock_gettime injected_clock_gettime
 #define pipe injected_pipe
 #define pthread_create injected_pthread_create
 #endif
@@ -88,6 +93,7 @@ static int injected_pthread_create(pthread_t *, const pthread_attr_t *,
 #ifdef _WIN32
 #undef ioctlsocket
 #undef WSAPoll
+#undef GetTickCount64
 #undef CreateEvent
 #undef CreateThread
 #undef closesocket
@@ -98,6 +104,7 @@ static int injected_pthread_create(pthread_t *, const pthread_attr_t *,
 #undef close
 #undef ioctl
 #undef poll
+#undef clock_gettime
 #undef pipe
 #undef pthread_create
 #endif
@@ -125,11 +132,28 @@ static unsigned int continuous_reads;
 static int control_query_failure;
 static socket_t udp_fixture_control = INVALID_FD;
 static atomic_int udp_fixture_phase = ATOMIC_VAR_INIT(0);
+static atomic_uint clock_advance_seconds = ATOMIC_VAR_INIT(0);
+static _Atomic(socket_t) expired_poll_control = ATOMIC_VAR_INIT(INVALID_FD);
+static int expire_connect_ready, expire_connect_result;
 #ifdef _WIN32
 static HANDLE failed_resolver_event;
 static WSAEVENT failed_control_event;
 #else
 static int failed_resolver_pipe[2];
+#endif
+
+#ifdef _WIN32
+static ULONGLONG injected_tick_count(void) {
+    return GetTickCount64() + (ULONGLONG)atomic_load_explicit(
+        &clock_advance_seconds, memory_order_relaxed) * 1000;
+}
+#else
+static int injected_clock_gettime(clockid_t clock, struct timespec *now) {
+    int result = clock_gettime(clock, now);
+    if (!result && clock == CLOCK_MONOTONIC)
+        now->tv_sec += atomic_load_explicit(&clock_advance_seconds, memory_order_relaxed);
+    return result;
+}
 #endif
 
 static void *injected_calloc(size_t count, size_t size) {
@@ -322,7 +346,17 @@ static int injected_connect(int fd, const struct sockaddr *address, socklen_t le
 #endif
         return -1;
     }
-    return connect(fd, address, length);
+    int result = connect(fd, address, length);
+    /* Even a provider completing immediately must exercise the chosen wait boundary. */
+    if (!result && (expire_connect_ready || expire_connect_result)) {
+#ifdef _WIN32
+        set_test_error(WSAEWOULDBLOCK);
+#else
+        set_test_error(EINPROGRESS);
+#endif
+        return -1;
+    }
+    return result;
 }
 
 #ifdef _WIN32
@@ -358,7 +392,39 @@ static int injected_getsockopt(int fd, int level, int option, void *value, sockl
         *length = sizeof(int);
         return 0;
     }
-    return getsockopt(fd, level, option, value, length);
+    int result = getsockopt(fd, level, option, value, length);
+    if (!result && expire_connect_result && fake_connect == 1 && !slow_socket(fd) &&
+        level == SOL_SOCKET && option == SO_ERROR && *(int *)value == 0) {
+        expire_connect_result = 0;
+        atomic_store_explicit(&clock_advance_seconds, CONNECT_TIMEOUT_SECONDS + 1,
+                              memory_order_relaxed);
+    }
+    return result;
+}
+
+/* Model a process resuming after its deadline, with real data already ready. */
+static void expire_poll_result(pollfd_t *fds, size_t count, int ready) {
+    if (ready <= 0) return;
+    socket_t control = atomic_load_explicit(&expired_poll_control, memory_order_acquire);
+    if (control == INVALID_FD) return;
+    for (size_t i = 0; i < count; ++i) {
+        if (fds[i].fd == control && atomic_compare_exchange_strong_explicit(
+                &expired_poll_control, &control, INVALID_FD,
+                memory_order_acq_rel, memory_order_acquire)) {
+            atomic_store_explicit(&clock_advance_seconds, IDLE_TIMEOUT_SECONDS + 1,
+                                  memory_order_relaxed);
+            return;
+        }
+    }
+}
+
+static int expire_connect_wait(int ready) {
+    if (ready > 0 && expire_connect_ready) {
+        expire_connect_ready = 0;
+        atomic_store_explicit(&clock_advance_seconds, CONNECT_TIMEOUT_SECONDS + 1,
+                              memory_order_relaxed);
+    }
+    return ready;
 }
 
 /* Hold the association's first poll until real TCP and UDP input are both queued. */
@@ -377,7 +443,9 @@ static void synchronize_udp_input(pollfd_t *fds, size_t count) {
 #ifdef _WIN32
 static int injected_wsa_poll(WSAPOLLFD *fds, ULONG count, INT timeout) {
     synchronize_udp_input(fds, count);
-    return WSAPoll(fds, count, timeout);
+    int ready = WSAPoll(fds, count, timeout);
+    expire_poll_result(fds, count, ready);
+    return ready;
 }
 
 static int injected_select(int ignored, fd_set *readable, fd_set *writable,
@@ -393,14 +461,18 @@ static int injected_select(int ignored, fd_set *readable, fd_set *writable,
         FD_CLR(slow_sockets[i], failed);
     }
     if (writable->fd_count || failed->fd_count)
-        return select(ignored, readable, writable, failed, timeout);
+        return expire_connect_wait(select(ignored, readable, writable, failed, timeout));
     retry_pause((int)(timeout->tv_sec * 1000 + timeout->tv_usec / 1000));
     return 0;
 }
 #else
 static int injected_poll(struct pollfd *fds, nfds_t count, int timeout) {
     synchronize_udp_input(fds, count);
-    if (!fake_connect) return poll(fds, count, timeout);
+    if (!fake_connect) {
+        int ready = poll(fds, count, timeout);
+        expire_poll_result(fds, count, ready);
+        return ready;
+    }
     ++connect_waits;
     struct pollfd visible[CONNECT_PENDING_LIMIT];
     assert(count <= CONNECT_PENDING_LIMIT);
@@ -418,7 +490,7 @@ static int injected_poll(struct pollfd *fds, nfds_t count, int timeout) {
     for (nfds_t i = 0; i < count; ++i)
         fds[i].revents = fake_connect == 3 && slow_socket(fds[i].fd) ?
                           POLLOUT : visible[i].revents;
-    return ready + forced;
+    return expire_connect_wait(ready + forced);
 }
 #endif
 
@@ -682,6 +754,121 @@ static void *associate_fixture_thread(void *argument) {
 #else
     return NULL;
 #endif
+}
+
+#ifdef _WIN32
+static DWORD WINAPI relay_fixture_thread(LPVOID argument) {
+#else
+static void *relay_fixture_thread(void *argument) {
+#endif
+    socket_t *peers = argument;
+    relay(peers[0], peers[1]);
+    close_socket(peers[0]);
+    close_socket(peers[1]);
+#ifdef _WIN32
+    return 0;
+#else
+    return NULL;
+#endif
+}
+
+static void test_expired_ready_events(void) {
+#ifdef _WIN32
+    WSADATA winsock;
+    assert(WSAStartup(MAKEWORD(2, 2), &winsock) == 0);
+#endif
+    for (int upstream = 0; upstream <= 1; ++upstream) {
+        socket_t client[2], target[2];
+        control_pair(client);
+        control_pair(target);
+        socket_t peers[2] = {client[0], target[0]};
+        atomic_store_explicit(&expired_poll_control, client[0], memory_order_release);
+#ifdef _WIN32
+        HANDLE thread = CreateThread(NULL, 0, relay_fixture_thread, peers, 0, NULL);
+        assert(thread != NULL);
+#else
+        pthread_t thread;
+        assert(pthread_create(&thread, NULL, relay_fixture_thread, peers) == 0);
+#endif
+        socket_t source = upstream ? client[1] : target[1];
+        socket_t receiver = upstream ? target[1] : client[1];
+        assert(send(source, "late", 4, 0) == 4);
+        assert(wait_for_io(receiver, POLLIN, monotonic_milliseconds() + 400));
+        char received[8];
+        assert(recv(receiver, received, sizeof(received), 0) == 0);
+#ifdef _WIN32
+        assert(WaitForSingleObject(thread, 400) == WAIT_OBJECT_0);
+        CloseHandle(thread);
+#else
+        assert(pthread_join(thread, NULL) == 0);
+#endif
+        assert(atomic_load_explicit(&clock_advance_seconds, memory_order_relaxed) ==
+               IDLE_TIMEOUT_SECONDS + 1);
+        close_socket(client[1]);
+        close_socket(target[1]);
+        atomic_store_explicit(&clock_advance_seconds, 0, memory_order_relaxed);
+    }
+
+    socket_t control[2];
+    control_pair(control);
+    assert(set_nonblocking(control[1], 1));
+    socket_t target = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    socket_t sender = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    assert(target != INVALID_FD && sender != INVALID_FD);
+    struct sockaddr_in local = {0};
+    local.sin_family = AF_INET;
+    local.sin_addr.s_addr = htonl(TEST_LOOPBACK_IP);
+    assert(bind(target, (struct sockaddr *)&local, sizeof(local)) == 0);
+    socklen_t length = sizeof(local);
+    assert(getsockname(target, (struct sockaddr *)&local, &length) == 0);
+    unsigned short port = ntohs(local.sin_port);
+#ifdef _WIN32
+    HANDLE thread = CreateThread(NULL, 0, associate_fixture_thread, &control[0], 0, NULL);
+    assert(thread != NULL);
+#else
+    pthread_t thread;
+    assert(pthread_create(&thread, NULL, associate_fixture_thread, &control[0]) == 0);
+#endif
+    unsigned char reply[10];
+    assert(recv_all(control[1], reply, sizeof(reply), monotonic_milliseconds() + 1000));
+    assert(reply[0] == 5 && reply[1] == 0 && reply[3] == 1);
+    struct sockaddr_in relay_address = {0};
+    relay_address.sin_family = AF_INET;
+    memcpy(&relay_address.sin_addr, reply + 4, 4);
+    memcpy(&relay_address.sin_port, reply + 8, 2);
+    const unsigned char packet[] = {0, 0, 0, 1, 127, 0, 0, 1,
+                                    (unsigned char)(port >> 8), (unsigned char)port,
+                                    'u', 'd', 'p'};
+    assert(sendto(sender, (const char *)packet, sizeof(packet), 0,
+                   (struct sockaddr *)&relay_address, sizeof(relay_address)) == sizeof(packet));
+    assert(wait_for_io(target, POLLIN, monotonic_milliseconds() + 1000));
+    struct sockaddr_in outbound;
+    length = sizeof(outbound);
+    char received[8];
+    assert(recvfrom(target, received, sizeof(received), 0,
+                     (struct sockaddr *)&outbound, &length) == 3);
+    assert(memcmp(received, packet + 10, 3) == 0);
+    atomic_store_explicit(&expired_poll_control, control[0], memory_order_release);
+    assert(sendto(target, "late", 4, 0, (struct sockaddr *)&outbound, length) == 4);
+    assert(!wait_for_io(sender, POLLIN, monotonic_milliseconds() + 100));
+    assert(wait_for_io(control[1], POLLIN, monotonic_milliseconds() + 400));
+    assert(recv(control[1], received, sizeof(received), 0) == 0);
+#ifdef _WIN32
+    assert(WaitForSingleObject(thread, 400) == WAIT_OBJECT_0);
+    CloseHandle(thread);
+#else
+    assert(pthread_join(thread, NULL) == 0);
+#endif
+    assert(atomic_load_explicit(&clock_advance_seconds, memory_order_relaxed) ==
+           IDLE_TIMEOUT_SECONDS + 1);
+    atomic_store_explicit(&clock_advance_seconds, 0, memory_order_relaxed);
+    close_socket(control[1]);
+    close_socket(sender);
+    close_socket(target);
+#ifdef _WIN32
+    WSACleanup();
+#endif
+    puts("Expired readiness checks passed (TCP both directions, UDP replies, no idle revival).");
 }
 
 static void test_udp_control_backlog(void) {
@@ -1204,6 +1391,27 @@ static void test_connection_fallback(void) {
     close_socket(accepted);
     close_socket(target);
 
+    for (int stage = 0; stage < 2; ++stage) {
+        reset_connect_test(1);
+        expire_connect_ready = stage == 0;
+        expire_connect_result = stage == 1;
+        target = connect_target("fallback.test", port, NULL, &status, INVALID_FD);
+        if (target != INVALID_FD)
+            fprintf(stderr, "Expired connection stage %d accepted a socket\n", stage);
+        assert(target == INVALID_FD);
+        assert(status == 4 && slow_closed == slow_count);
+        assert(expire_connect_ready == 0 && expire_connect_result == 0);
+        accepted = accept(listener, NULL, NULL);
+        assert(accepted != INVALID_FD && set_nonblocking(accepted, 1));
+        assert(wait_for_io(accepted, POLLIN, monotonic_milliseconds() + 400));
+        assert(recv(accepted, (char *)payload, sizeof(payload), 0) == 0);
+        close_socket(accepted);
+        assert(atomic_load_explicit(&clock_advance_seconds, memory_order_relaxed) ==
+               CONNECT_TIMEOUT_SECONDS + 1);
+        wait_for_resolvers();
+        atomic_store_explicit(&clock_advance_seconds, 0, memory_order_relaxed);
+    }
+
     reset_connect_test(2);
     start = monotonic_milliseconds();
     assert(connect_target("fallback.test", port, NULL, &status, INVALID_FD) == INVALID_FD);
@@ -1259,7 +1467,7 @@ static void test_connection_fallback(void) {
 #ifdef _WIN32
     WSACleanup();
 #endif
-    puts("TCP fallback checks passed (slow candidates, shared deadline, cleanup, errors, client reset).");
+    puts("TCP fallback checks passed (slow candidates, shared deadline, expired readiness/results, cleanup, errors, client reset).");
 }
 
 int main(int argc, char **argv) {
@@ -1268,6 +1476,7 @@ int main(int argc, char **argv) {
         puts("UDP DNS checks passed (100 literals, zero resolutions; 100 case variants, one resolution; syntax, TTL, ports, failures).");
         test_udp_control_fairness();
         test_udp_control_backlog();
+        test_expired_ready_events();
         test_connection_fallback();
         test_resolver_deadline_and_limit();
         test_resolver_control_close();
