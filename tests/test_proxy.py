@@ -788,6 +788,23 @@ class ProxyTests(ProxyTestCase):
                     target.sendto(data, outbound)
                     self.assertEqual(client.recvfrom(65536)[0], header + payload)
 
+            # A legal target datagram can exceed the client's UDP limit after
+            # SOCKS encapsulation. Drop it whole, rather than forward a prefix,
+            # and keep the association and target permission usable afterward.
+            for size in sorted({payload_limit + 1, target_limit}):
+                if size > target_limit or size <= payload_limit:
+                    continue
+                with self.subTest(oversized_reply=size, target_family=family):
+                    payload = random.Random(size).getrandbits(size * 8).to_bytes(size, "little")
+                    target.sendto(payload, outbound)
+                    client.settimeout(0.15)
+                    with self.assertRaises(socket.timeout):
+                        client.recvfrom(65536)
+                    following = b"after oversized reply" + size.to_bytes(2, "big")
+                    target.sendto(following, outbound)
+                    client.settimeout(2)
+                    self.assertEqual(client.recvfrom(65536)[0], header + following)
+
     def test_udp_numeric_payload_sizes(self):
         for family, host in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
             self.large_udp_round_trip(family, host)
