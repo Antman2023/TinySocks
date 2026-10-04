@@ -141,6 +141,8 @@ Windows 上默认使用 `python`，其他平台使用 `python3`；可通过 `mak
 
 CI 还通过 [QEMU 用户模式](https://www.qemu.org/docs/master/user/main.html)分别运行实际的 Linux ARM64、ARMv7、大端 MIPS 和小端 MIPSel 发布附件，执行同一套发布协议测试。Linux 主机安装 `qemu-user` 后可使用 `python3 tests/test_proxy.py dist/tinysocks-linux-mips --release --runner qemu-mips -v` 复现；其他架构分别使用 `qemu-aarch64`、`qemu-arm` 和 `qemu-mipsel`。模拟运行时跳过下述本机地址空间限制检查，避免把模拟器自身的内存开销算入代理限制；本机 Linux 检查仍执行。四个模拟测试均通过后才允许发布版本。
 
+四种架构也使用相应发布程序的优化、LTO、静态链接及 1 MiB 线程栈参数交叉编译故障程序，执行全部内部检查及与本机相同的故障协议测试，覆盖解析期限、取消、名额保持、通知资源回收、监听恢复和短收发。使用 `make cross-fault-tests` 构建后，可通过 `qemu-mips test-bin/tinysocks-fault-linux-mips --test-internals` 运行 MIPS 内部检查。故障程序及其校验文件保存在独立的 Actions 附件中，正式 Release 仍只包含九个程序和发布校验文件；跨架构故障检查同样属于发布门禁。
+
 Zig 0.16.0 的 MIPS/MIPSel `pipe` 包装在成功创建管道时会返回首个文件描述符的正数值。DNS 通知管道以负返回值判断失败，并继续配置及验证两个描述符，避免把已成功创建的管道误判为失败而取消解析。内部回归在 Linux/macOS 的真实管道上模拟该返回值，验证 TCP/UDP 域名解析、管道和任务回收及后续解析恢复；四种模拟附件的完整协议测试另覆盖实际的 `localhost` TCP 转发与 UDP 大小写、不同目标端口转发。模拟测试失败时 CI 会输出域名连接的系统调用跟踪，便于定位资源准备或解析故障。
 
 Linux 正式附件另在 128 MiB 进程地址空间限制下同时保持默认的 64 个 UDP 会话，确认每个会话可完整转发最大 IPv4 载荷及域名报文，并报告进程的虚拟内存、驻留内存和线程数。该检查只约束代理子进程，不限制测试进程；其他系统及短期限测试程序跳过它。

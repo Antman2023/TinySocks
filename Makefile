@@ -17,6 +17,8 @@ MIPS_FLAGS := -std=c11 -Oz -flto -Wall -Wextra \
               -fno-unwind-tables -fno-asynchronous-unwind-tables \
               -Wl,--gc-sections -Wl,-z,stack-size=1048576 -s
 
+TEST_LIMIT_FLAGS := -DMAX_CLIENTS=2 -DHANDSHAKE_TIMEOUT_SECONDS=1 -DIDLE_TIMEOUT_SECONDS=3
+
 ifeq ($(OS),Windows_NT)
 HOST_OUTPUT := tinysocks.exe
 TEST_OUTPUT := tinysocks-test.exe
@@ -43,7 +45,12 @@ RELEASE_OUTPUTS := dist/tinysocks-linux-x86_64 dist/tinysocks-linux-arm64 \
                    dist/tinysocks-windows-arm64.exe dist/tinysocks-macos-x86_64 \
                    dist/tinysocks-macos-arm64
 
-.PHONY: all mipsel mips host test release test-release
+CROSS_FAULT_OUTPUTS := test-bin/tinysocks-fault-linux-arm64 \
+                      test-bin/tinysocks-fault-linux-armv7 \
+                      test-bin/tinysocks-fault-linux-mips \
+                      test-bin/tinysocks-fault-linux-mipsel
+
+.PHONY: all mipsel mips host test release test-release cross-fault-tests
 
 all: mipsel
 
@@ -54,6 +61,8 @@ mips: tinysocks-mips
 host: $(HOST_OUTPUT)
 
 release: $(RELEASE_OUTPUTS)
+
+cross-fault-tests: $(CROSS_FAULT_OUTPUTS)
 
 test-release: $(HOST_OUTPUT)
 	$(PYTHON) tests/test_proxy.py ./$(HOST_OUTPUT) --release -v
@@ -70,12 +79,27 @@ test: $(TEST_OUTPUT) $(FAULT_TEST_OUTPUT)
 		WindowsUDPBindingTests WindowsUDPIPv6BindingTests -v
 
 $(FAULT_TEST_OUTPUT): tests/test_faults.c tinysocks.c Makefile
-	$(ZIG) cc $(HOST_FLAGS) -DMAX_CLIENTS=2 \
-		-DHANDSHAKE_TIMEOUT_SECONDS=1 -DIDLE_TIMEOUT_SECONDS=3 tests/test_faults.c -o $@ $(HOST_LIBS)
+	$(ZIG) cc $(HOST_FLAGS) $(TEST_LIMIT_FLAGS) tests/test_faults.c -o $@ $(HOST_LIBS)
 
 $(TEST_OUTPUT): tinysocks.c Makefile
-	$(ZIG) cc $(HOST_FLAGS) -DMAX_CLIENTS=2 \
-		-DHANDSHAKE_TIMEOUT_SECONDS=1 -DIDLE_TIMEOUT_SECONDS=3 tinysocks.c -o $@ $(HOST_LIBS)
+	$(ZIG) cc $(HOST_FLAGS) $(TEST_LIMIT_FLAGS) tinysocks.c -o $@ $(HOST_LIBS)
+
+test-bin:
+	mkdir test-bin
+
+$(CROSS_FAULT_OUTPUTS): tests/test_faults.c tinysocks.c Makefile | test-bin
+
+test-bin/tinysocks-fault-linux-arm64:
+	$(ZIG) cc -target aarch64-linux-musl $(LINUX_FLAGS) $(TEST_LIMIT_FLAGS) tests/test_faults.c -o $@ -pthread -static
+
+test-bin/tinysocks-fault-linux-armv7:
+	$(ZIG) cc -target arm-linux-musleabihf $(LINUX_FLAGS) $(TEST_LIMIT_FLAGS) tests/test_faults.c -o $@ -pthread -static
+
+test-bin/tinysocks-fault-linux-mips:
+	$(ZIG) cc -target mips-linux-musleabi $(MIPS_FLAGS) $(TEST_LIMIT_FLAGS) tests/test_faults.c -o $@ -pthread -static
+
+test-bin/tinysocks-fault-linux-mipsel:
+	$(ZIG) cc -target mipsel-linux-musleabi $(MIPS_FLAGS) $(TEST_LIMIT_FLAGS) tests/test_faults.c -o $@ -pthread -static
 
 tinysocks-mipsel: tinysocks.c Makefile
 	$(ZIG) cc -target mipsel-linux-musleabi $(MIPS_FLAGS) tinysocks.c -o $@ -pthread -static

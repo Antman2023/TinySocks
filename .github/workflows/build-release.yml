@@ -80,6 +80,17 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+      - name: Build Linux cross-architecture fault tests
+        run: |
+          make cross-fault-tests
+          (cd test-bin && sha256sum tinysocks-fault-linux-* > SHA256SUMS)
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tinysocks-linux-fault-tests
+          path: test-bin/
+          if-no-files-found: error
+
   test-release:
     needs: build
     strategy:
@@ -138,6 +149,10 @@ jobs:
         with:
           name: tinysocks-binaries
           path: dist
+      - uses: actions/download-artifact@v8
+        with:
+          name: tinysocks-linux-fault-tests
+          path: test-bin
       - name: Install Linux user-mode emulators
         run: |
           sudo apt-get update
@@ -152,6 +167,19 @@ jobs:
             python3 tests/trace_domain.py "$binary" ${{ matrix.runner }}
             exit 1
           fi
+      - name: Verify and run cross-architecture fault checks
+        run: |
+          (cd test-bin && sha256sum -c SHA256SUMS)
+          binary=test-bin/tinysocks-fault-linux-${{ matrix.arch }}
+          chmod +x "$binary"
+          ${{ matrix.runner }} "$binary" --test-internals
+          python3 tests/test_proxy.py "$binary" --faults --runner ${{ matrix.runner }} \
+            FaultProxyTests FaultClientSetupTests FaultTCPIOTests \
+            ProxyTests.test_domain_connect_and_pipelined_payload \
+            ProxyTests.test_udp_domain_and_empty_payload IPv6ProxyTests \
+            ProxyTests.test_udp_numeric_payload_sizes \
+            WildcardListenerTests WildcardIPv6ListenerTests \
+            WindowsUDPBindingTests WindowsUDPIPv6BindingTests -v
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
