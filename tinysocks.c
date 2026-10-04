@@ -181,6 +181,23 @@ static int set_exclusive_address_use(socket_t fd) {
 #endif
 }
 
+static int set_udp_socket_options(socket_t fd) {
+    if (!set_exclusive_address_use(fd)) return 0;
+#ifdef __APPLE__
+    /* Darwin's UDP send space is also its maximum datagram size (default 9 KiB).
+       Allow full packets without reducing a larger system-configured capacity. */
+    int capacity;
+    socklen_t length = (socklen_t)sizeof(capacity);
+    if (getsockopt(fd, SOL_SOCKET, SO_SNDBUF, (char *)&capacity, &length) != 0) return 0;
+    if (capacity < UDP_BUFFER_SIZE) {
+        capacity = UDP_BUFFER_SIZE;
+        if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF,
+                       (const char *)&capacity, sizeof(capacity)) != 0) return 0;
+    }
+#endif
+    return 1;
+}
+
 static int set_nonblocking(socket_t fd, int enabled) {
 #ifdef _WIN32
     u_long mode = enabled ? 1 : 0;
@@ -1006,7 +1023,7 @@ static int send_udp_request(const unsigned char *payload, size_t length,
     if (*outbound == INVALID_FD) {
         *outbound = socket(destination->ss_family, SOCK_DGRAM, IPPROTO_UDP);
         if (*outbound != INVALID_FD &&
-            (!set_exclusive_address_use(*outbound) || !set_nonblocking(*outbound, 1))) {
+            (!set_udp_socket_options(*outbound) || !set_nonblocking(*outbound, 1))) {
             close_socket(*outbound);
             *outbound = INVALID_FD;
         }
@@ -1184,7 +1201,7 @@ static void udp_associate(socket_t client, unsigned short requested_port) {
     set_address_port(&local, 0);
     association = socket(local.ss_family, SOCK_DGRAM, IPPROTO_UDP);
     if (association == INVALID_FD ||
-        !set_exclusive_address_use(association) ||
+        !set_udp_socket_options(association) ||
         bind(association, (struct sockaddr *)&local, address_length(&local)) != 0 ||
         !set_nonblocking(association, 1))
         goto failed;

@@ -81,6 +81,8 @@ tinysocks [监听地址 [端口]]
 
 Windows 的 TCP 监听、UDP 关联端口及 UDP 出站套接字均在绑定前启用 `SO_EXCLUSIVEADDRUSE`，保护接收端点，避免其他本地套接字接走连接或目标回复；出站 UDP 在首次发送触发隐式绑定前完成该配置。配置失败时立即关闭新套接字；UDP 关联建立失败返回状态 `1`，出站配置失败则丢弃本次请求，不写入目标许可或 DNS 缓存，也不锁定客户端端口，后续请求可重新建立套接字。Windows 的通配地址监听也会拒绝在已被其他监听程序占用的端口上启动。Linux 和 macOS 的 TCP 监听使用 `SO_REUSEADDR` 支持正常重启。绑定规则详见 [Windows 套接字文档](https://learn.microsoft.com/en-us/windows/win32/winsock/using-so-reuseaddr-and-so-exclusiveaddruse)。
 
+macOS 的 UDP 关联及出站套接字将不足 64 KiB 的发送容量提高到 64 KiB，保留系统已有的更大容量，使较大数据报可以完整转发。Darwin 的默认 UDP 发送容量为 9,216 字节，也限制单个数据报大小；详见 [Apple UDP 实现](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/netinet/udp_usrreq.c)与[套接字发送实现](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/uipc_socket.c)。查询或设置容量失败时立即关闭新套接字，关联建立返回状态 `1`；出站失败不写入目标许可或 DNS 缓存，后续请求可重试。报文连同 SOCKS5 头仍须符合所用 IP 版本的 UDP 长度限制。
+
 macOS 的通配地址与具体地址允许同账户下通过 `SO_REUSEADDR` 重叠绑定，不能据此提供 Windows 的独占保证；需要避免这类端点重叠时，请指定具体监听地址。该行为由 [XNU 的绑定检查](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/netinet/in_pcb.c)决定。
 
 端口必须为 `0` 到 `65535` 的十进制数字；端口 `0` 由系统分配可用端口，例如 `tinysocks 127.0.0.1 0`。启动日志显示实际绑定的数字地址和端口，IPv6 地址使用方括号，如 `[::1]:1080`。使用 `tinysocks --help` 或 `tinysocks -h` 查看用法。
@@ -124,6 +126,8 @@ make test
 ```
 
 测试会自动编译专用程序，使用 2 个客户端、1 秒握手和 3 秒空闲限制。使用系统分配的监听端口，无需预留端口或建立探测连接。覆盖命令行参数和帮助、实际监听地址、协议拒绝、最大认证方法列表、截断及分段握手、握手与应用数据连发后半关闭、IPv4/IPv6 监听与目标、域名和 TCP/UDP IPv4 映射地址、双向转发背压、大数据半关闭、客户端数量限制，以及 UDP 来源校验、端口锁定、发送失败后重新识别客户端端口、空载荷与大报文、空闲超时和会话回收；无效 UDP 报文和 TCP 控制数据均不能延长 UDP 会话寿命。不需要访问外网，IPv6 回环不可用时跳过相应测试。
+
+大 UDP 报文回归分别使用 IPv4/IPv6 客户端及目标，验证空载荷、8 KiB、16 KiB、48 KiB 和 65,485 字节载荷的完整请求及回复；IPv6 目标头加最大测试载荷恰好达到 IPv4 UDP 长度上限。测试端点显式设置足够的收发容量，验证代理自身的数据报处理。普通、故障注入及实际发布附件均执行这些检查；macOS 内部检查还覆盖发送容量查询和设置失败后的回收、重试，以及保留更大容量。
 
 Windows 上默认使用 `python`，其他平台使用 `python3`；可通过 `make test PYTHON=解释器路径` 指定解释器。
 

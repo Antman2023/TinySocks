@@ -49,6 +49,9 @@ static int injected_accept(int, struct sockaddr *, socklen_t *);
 static int injected_connect(int, const struct sockaddr *, socklen_t);
 static int injected_close(int);
 static int injected_getsockopt(int, int, int, void *, socklen_t *);
+#ifdef __APPLE__
+static int injected_setsockopt(int, int, int, const void *, socklen_t);
+#endif
 static ssize_t injected_recv(int, void *, size_t, int);
 static ssize_t injected_send(int, const void *, size_t, int);
 static int injected_ioctl(int, unsigned long, int *);
@@ -69,8 +72,10 @@ static int injected_pthread_create(pthread_t *, const pthread_attr_t *,
 #define free injected_free
 #define recv injected_recv
 #define send injected_send
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
 #define setsockopt injected_setsockopt
+#endif
+#ifdef _WIN32
 #define ioctlsocket injected_ioctlsocket
 #define WSAPoll injected_wsa_poll
 #define GetTickCount64 injected_tick_count
@@ -102,8 +107,10 @@ static int injected_pthread_create(pthread_t *, const pthread_attr_t *,
 #undef free
 #undef recv
 #undef send
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
 #undef setsockopt
+#endif
+#ifdef _WIN32
 #undef ioctlsocket
 #undef WSAPoll
 #undef GetTickCount64
@@ -163,9 +170,11 @@ static atomic_uint clock_advance_seconds = ATOMIC_VAR_INIT(0);
 static _Atomic(socket_t) expired_poll_control = ATOMIC_VAR_INIT(INVALID_FD);
 static int expire_connect_ready, expire_connect_result;
 static socket_t expired_connect_socket = INVALID_FD;
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
 static atomic_int udp_binding_failure = ATOMIC_VAR_INIT(0);
 static socket_t failed_udp_binding_socket = INVALID_FD;
+#endif
+#ifdef _WIN32
 static HANDLE failed_resolver_event;
 static WSAEVENT failed_control_event;
 #else
@@ -389,9 +398,18 @@ static ssize_t injected_send(int fd, const void *buffer, size_t length, int flag
     return n;
 }
 
+#if defined(_WIN32) || defined(__APPLE__)
 #ifdef _WIN32
 static int injected_setsockopt(SOCKET fd, int level, int option, const char *value, int length) {
-    if (level == SOL_SOCKET && option == SO_EXCLUSIVEADDRUSE &&
+#else
+static int injected_setsockopt(int fd, int level, int option, const void *value, socklen_t length) {
+#endif
+#ifdef _WIN32
+    const int setup_option = SO_EXCLUSIVEADDRUSE;
+#else
+    const int setup_option = SO_SNDBUF;
+#endif
+    if (level == SOL_SOCKET && option == setup_option &&
         atomic_load_explicit(&udp_binding_failure, memory_order_relaxed)) {
         int type;
         socklen_t type_length = sizeof(type);
@@ -400,7 +418,7 @@ static int injected_setsockopt(SOCKET fd, int level, int option, const char *val
             int error = atomic_exchange_explicit(&udp_binding_failure, 0, memory_order_relaxed);
             failed_udp_binding_socket = fd;
             set_test_error(error);
-            return SOCKET_ERROR;
+            return -1;
         }
     }
     return setsockopt(fd, level, option, value, length);
@@ -556,6 +574,27 @@ static int injected_close(int fd) {
 static int injected_getsockopt(SOCKET fd, int level, int option, char *value, int *length) {
 #else
 static int injected_getsockopt(int fd, int level, int option, void *value, socklen_t *length) {
+#endif
+#ifdef __APPLE__
+    int setup_error = atomic_load_explicit(&udp_binding_failure, memory_order_relaxed);
+    if (setup_error && level == SOL_SOCKET && option == SO_SNDBUF) {
+        int type;
+        socklen_t type_length = sizeof(type);
+        assert(getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &type_length) == 0);
+        if (type == SOCK_DGRAM) {
+            if (setup_error < 0) {
+                atomic_store_explicit(&udp_binding_failure, 0, memory_order_relaxed);
+                failed_udp_binding_socket = fd;
+                errno = -setup_error;
+                return -1;
+            }
+            /* Exercise configuration failure even on hosts with larger defaults. */
+            assert(*length >= sizeof(int));
+            *(int *)value = 1024;
+            *length = sizeof(int);
+            return 0;
+        }
+    }
 #endif
     if (fake_connect == 3 && slow_socket(fd) && level == SOL_SOCKET && option == SO_ERROR) {
 #ifdef _WIN32
@@ -1113,21 +1152,27 @@ static void *relay_fixture_thread(void *argument) {
 #endif
 }
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
 static void assert_failed_udp_binding_closed(void) {
     assert(atomic_load_explicit(&udp_binding_failure, memory_order_relaxed) == 0);
     assert(failed_udp_binding_socket != INVALID_FD);
     int type;
     socklen_t length = sizeof(type);
     assert(getsockopt(failed_udp_binding_socket, SOL_SOCKET, SO_TYPE,
-                       (char *)&type, &length) == SOCKET_ERROR);
+                       (char *)&type, &length) == -1);
+#ifdef _WIN32
     assert(socket_error() == WSAENOTSOCK);
+#else
+    assert(socket_error() == EBADF);
+#endif
     failed_udp_binding_socket = INVALID_FD;
 }
 
 static void test_udp_binding_failures(void) {
+#ifdef _WIN32
     WSADATA winsock;
     assert(WSAStartup(MAKEWORD(2, 2), &winsock) == 0);
+#endif
     wait_for_resolvers();
     socket_t target = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     assert(target != INVALID_FD);
@@ -1140,7 +1185,12 @@ static void test_udp_binding_failures(void) {
     unsigned short port = ntohs(local.sin_port);
     int previous_fake_dns = fake_dns;
     fake_dns = 1;
+#ifdef _WIN32
     const int failures[] = {WSAENOBUFS, WSAEACCES};
+#else
+    /* Positive errors fail setting capacity; negative errors fail its query. */
+    const int failures[] = {ENOBUFS, EACCES, -ENOBUFS, -EBADF};
+#endif
     for (unsigned int i = 0; i < sizeof(failures) / sizeof(failures[0]); ++i) {
         struct udp_destination destinations[UDP_DESTINATION_LIMIT] = {{0}};
         struct udp_dns_entry cache[UDP_DNS_CACHE_LIMIT] = {{0}};
@@ -1176,20 +1226,45 @@ static void test_udp_binding_failures(void) {
 
         control_pair(control);
         assert(set_nonblocking(control[1], 1));
+#ifdef _WIN32
         HANDLE thread = CreateThread(NULL, 0, associate_fixture_thread, &control[0], 0, NULL);
         assert(thread != NULL);
+#else
+        pthread_t thread;
+        assert(pthread_create(&thread, NULL, associate_fixture_thread, &control[0]) == 0);
+#endif
         assert(recv_all(control[1], reply, sizeof(reply), monotonic_milliseconds() + 1000));
         assert(reply[0] == 5 && reply[1] == 0 && reply[2] == 0 && reply[3] == 1);
+#ifdef _WIN32
         assert(shutdown(control[1], SD_SEND) == 0);
         assert(WaitForSingleObject(thread, 400) == WAIT_OBJECT_0);
         CloseHandle(thread);
+#else
+        assert(shutdown(control[1], SHUT_WR) == 0);
+        assert(pthread_join(thread, NULL) == 0);
+#endif
         close_socket(control[1]);
     }
     wait_for_resolvers();
     fake_dns = previous_fake_dns;
     close_socket(target);
+#ifdef _WIN32
     WSACleanup();
     puts("Windows UDP binding checks passed (provider failures, closed sockets, no stale grants/cache, retry, association recovery).");
+#else
+    socket_t configured = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    assert(configured != INVALID_FD);
+    int capacity = UDP_BUFFER_SIZE * 2;
+    assert(setsockopt(configured, SOL_SOCKET, SO_SNDBUF, &capacity, sizeof(capacity)) == 0);
+    length = sizeof(capacity);
+    assert(getsockopt(configured, SOL_SOCKET, SO_SNDBUF, &capacity, &length) == 0);
+    int previous_capacity = capacity;
+    assert(set_udp_socket_options(configured));
+    assert(getsockopt(configured, SOL_SOCKET, SO_SNDBUF, &capacity, &length) == 0);
+    assert(capacity >= previous_capacity);
+    close_socket(configured);
+    puts("macOS UDP buffer checks passed (query/setup failures, closed sockets, no stale grants/cache, retry, association recovery, larger capacity preserved).");
+#endif
 }
 #endif
 
@@ -1912,7 +1987,7 @@ int main(int argc, char **argv) {
         test_dns_cache();
         puts("UDP DNS checks passed (100 literals, zero resolutions; 100 case variants, one resolution; syntax, TTL, ports, failures).");
         test_udp_destination_lifetime();
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
         test_udp_binding_failures();
 #endif
         test_udp_control_fairness();
