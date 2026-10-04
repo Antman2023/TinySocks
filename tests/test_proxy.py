@@ -1,4 +1,4 @@
-"""End-to-end checks for a build with limits of 2 clients, 1s handshake, 3s idle."""
+"""Protocol checks; --release skips checks needing shortened build-time limits."""
 
 import random
 import socket
@@ -15,6 +15,10 @@ BINARY = Path(sys.argv.pop(1)).resolve()
 FAULTS_ENABLED = "--faults" in sys.argv
 if FAULTS_ENABLED:
     sys.argv.remove("--faults")
+RELEASE_ENABLED = "--release" in sys.argv
+if RELEASE_ENABLED:
+    sys.argv.remove("--release")
+requires_test_limits = unittest.skipIf(RELEASE_ENABLED, "requires shortened test limits")
 GREETING = b"\x05\x01\x00"
 
 
@@ -409,6 +413,7 @@ class ProxyTests(ProxyTestCase):
             client.settimeout(2)
             self.assertEqual(client.recvfrom(100)[0], request)
 
+    @requires_test_limits
     def test_udp_invalid_traffic_does_not_extend_idle_timeout(self):
         with self.control() as control, \
              socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
@@ -538,6 +543,7 @@ class ProxyTests(ProxyTestCase):
                     self.assertEqual(client.recvfrom(100)[0], b"\x00\x00\x00" +
                                      encode_address(*target.getsockname()) + b"mapped")
 
+    @requires_test_limits
     def test_udp_control_data_does_not_extend_idle_timeout(self):
         with self.control() as control:
             self.associate(control)
@@ -606,6 +612,7 @@ class ProxyTests(ProxyTestCase):
             self.assertEqual(response[10:], b"legitimate")
             self.assertEqual(int.from_bytes(response[8:10], "big"), target_port)
 
+    @requires_test_limits
     def test_client_limit(self):
         with self.control() as first, self.control() as second:
             with socket.create_connection(("127.0.0.1", self.port), 2) as blocked:
@@ -627,6 +634,7 @@ class ProxyTests(ProxyTestCase):
                         raise
                     time.sleep(0.02)
 
+    @requires_test_limits
     def test_handshake_deadline(self):
         with self.control() as control:
             control.sendall(b"\x05")
@@ -638,6 +646,7 @@ class ProxyTests(ProxyTestCase):
             except ConnectionError:
                 pass  # Windows can reset a connection with unread request bytes.
 
+    @requires_test_limits
     def test_tcp_idle_timeout(self):
         with socket.socket() as target_listener:
             target_listener.bind(("127.0.0.1", 0))

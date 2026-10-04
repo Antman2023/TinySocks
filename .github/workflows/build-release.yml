@@ -17,16 +17,10 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            binary: tinysocks-test
-            libs: -pthread
             python: python3
           - os: macos-latest
-            binary: tinysocks-test
-            libs: -pthread
             python: python3
           - os: windows-latest
-            binary: tinysocks-test.exe
-            libs: -lws2_32
             python: python
     runs-on: ${{ matrix.os }}
     steps:
@@ -37,11 +31,7 @@ jobs:
       - name: Test SOCKS5 behavior
         shell: bash
         run: |
-          zig cc -std=c11 -O2 -Wall -Wextra -Werror -DMAX_CLIENTS=2 -DIDLE_TIMEOUT_SECONDS=3 -DHANDSHAKE_TIMEOUT_SECONDS=1 tinysocks.c -o ${{ matrix.binary }} ${{ matrix.libs }}
-          ${{ matrix.python }} tests/test_proxy.py ./${{ matrix.binary }} -v
-          zig cc -std=c11 -O2 -Wall -Wextra -Werror -DMAX_CLIENTS=2 -DIDLE_TIMEOUT_SECONDS=3 -DHANDSHAKE_TIMEOUT_SECONDS=1 tests/test_faults.c -o fault-${{ matrix.binary }} ${{ matrix.libs }}
-          ./fault-${{ matrix.binary }} --test-internals
-          ${{ matrix.python }} tests/test_proxy.py ./fault-${{ matrix.binary }} --faults FaultProxyTests ProxyTests.test_domain_connect_and_pipelined_payload ProxyTests.test_udp_domain_and_empty_payload IPv6ProxyTests -v
+          make test PYTHON=${{ matrix.python }}
 
   test-memory:
     runs-on: ubuntu-latest
@@ -67,17 +57,7 @@ jobs:
 
       - name: Build Linux, Windows, and macOS binaries
         run: |
-          mkdir dist
-          zig cc -target x86_64-linux-musl -std=c11 -O2 -Wall -Wextra tinysocks.c -o dist/tinysocks-linux-x86_64 -pthread -static
-          zig cc -target aarch64-linux-musl -std=c11 -O2 -Wall -Wextra tinysocks.c -o dist/tinysocks-linux-arm64 -pthread -static
-          zig cc -target arm-linux-musleabihf -std=c11 -O2 -Wall -Wextra tinysocks.c -o dist/tinysocks-linux-armv7 -pthread -static
-          make mipsel mips
-          cp tinysocks-mipsel dist/tinysocks-linux-mipsel
-          cp tinysocks-mips dist/tinysocks-linux-mips
-          zig cc -target x86_64-windows-gnu -std=c11 -O2 -Wall -Wextra tinysocks.c -o dist/tinysocks-windows-x86_64.exe -lws2_32
-          zig cc -target aarch64-windows-gnu -std=c11 -O2 -Wall -Wextra tinysocks.c -o dist/tinysocks-windows-arm64.exe -lws2_32
-          zig cc -target x86_64-macos -std=c11 -O2 -Wall -Wextra tinysocks.c -o dist/tinysocks-macos-x86_64 -pthread
-          zig cc -target aarch64-macos -std=c11 -O2 -Wall -Wextra tinysocks.c -o dist/tinysocks-macos-arm64 -pthread
+          make release
           (cd dist && sha256sum tinysocks-* > SHA256SUMS)
 
       - uses: actions/upload-artifact@v7
@@ -86,9 +66,46 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  test-release:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            binary: tinysocks-linux-x86_64
+            python: python3
+          - os: macos-latest
+            binary: tinysocks-macos
+            python: python3
+          - os: windows-latest
+            binary: tinysocks-windows-x86_64.exe
+            python: python
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: tinysocks-binaries
+          path: dist
+      - name: Verify and test release binaries
+        shell: bash
+        run: |
+          (cd dist && sha256sum -c SHA256SUMS)
+          binary=${{ matrix.binary }}
+          if [ "$RUNNER_OS" = macOS ]; then
+            case "$(uname -m)" in
+              arm64) binary=tinysocks-macos-arm64 ;;
+              x86_64) binary=tinysocks-macos-x86_64 ;;
+              *) exit 1 ;;
+            esac
+          fi
+          if [ "$RUNNER_OS" != Windows ]; then chmod +x "dist/$binary"; fi
+          ${{ matrix.python }} tests/test_proxy.py "dist/$binary" --release -v
+
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: [build, test-release]
     runs-on: ubuntu-latest
     permissions:
       contents: write

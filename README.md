@@ -22,6 +22,8 @@ git push origin v1.0.0
 
 Linux 和 macOS 程序下载后需要添加执行权限，例如 `chmod +x tinysocks-linux-x86_64`。
 
+发布程序保留 `-O2` 优化，移除调试信息并清理未使用代码；Linux 还使用链接时优化（LTO）。Windows 和 macOS 使用各自支持的链接参数。发布附件只包含九个程序及校验文件，不包含 PDB 调试文件。CI 会下载实际构建附件，在三个系统上校验 SHA256 并执行协议测试，通过后才创建 Release。
+
 ## 编译
 
 安装 Zig 和 GNU Make 后，在仓库目录运行：
@@ -30,6 +32,7 @@ Linux 和 macOS 程序下载后需要添加执行权限，例如 `chmod +x tinys
 make        # 默认：这台设备使用的小端 MIPS 静态版本
 make mips   # 大端 MIPS 静态版本
 make host   # 当前电脑的版本
+make release # 全部九个平台/架构，输出到 dist/
 ```
 
 修改源码或 Makefile 后再次运行 `make` 会自动重新编译。也可以不用 Make，直接运行以下 `zig cc` 命令。
@@ -37,13 +40,19 @@ make host   # 当前电脑的版本
 Windows（PowerShell）：
 
 ```powershell
-zig cc -std=c11 -O2 -Wall -Wextra tinysocks.c -o tinysocks.exe -lws2_32
+zig cc -std=c11 -O2 -Wall -Wextra -ffunction-sections -fdata-sections '-Wl,--gc-sections' -s tinysocks.c -o tinysocks.exe -lws2_32
 ```
 
-Linux/macOS：
+Linux：
 
 ```sh
-zig cc -std=c11 -O2 -Wall -Wextra tinysocks.c -o tinysocks -pthread
+zig cc -std=c11 -O2 -flto -Wall -Wextra -ffunction-sections -fdata-sections '-Wl,--gc-sections' -s tinysocks.c -o tinysocks -pthread
+```
+
+macOS：
+
+```sh
+zig cc -std=c11 -O2 -Wall -Wextra '-Wl,-dead_strip' -s tinysocks.c -o tinysocks -pthread
 ```
 
 Linux MIPS 交叉编译（静态链接，按体积优化，适用于相应的 MIPS32 soft-float ABI）：
@@ -99,6 +108,8 @@ make test
 测试会自动编译专用程序，使用 2 个客户端、1 秒握手和 3 秒空闲限制。使用系统分配的监听端口，无需预留端口或建立探测连接。覆盖命令行参数和帮助、实际监听地址、协议拒绝、最大认证方法列表、截断及分段握手、握手与应用数据连发后半关闭、IPv4/IPv6 监听与目标、域名和 TCP/UDP IPv4 映射地址、双向转发背压、大数据半关闭、客户端数量限制，以及 UDP 来源校验、端口锁定、发送失败后重新识别客户端端口、空载荷与大报文、空闲超时和会话回收；无效 UDP 报文和 TCP 控制数据均不能延长 UDP 会话寿命。不需要访问外网，IPv6 回环不可用时跳过相应测试。
 
 Windows 上默认使用 `python`，其他平台使用 `python3`；可通过 `make test PYTHON=解释器路径` 指定解释器。
+
+`make test` 使用与本机发布程序相同的优化和链接参数。`make test-release` 则编译并测试默认运行限制的本机程序；跨平台附件也可用 `python tests/test_proxy.py 程序路径 --release -v` 检查。发布测试保留 TCP/UDP、域名、IPv4/IPv6、背压和半关闭等协议检查，仅跳过依赖短超时或两客户端限制的检查及故障注入专用检查；这些检查仍由 `make test` 和内存检查任务执行。
 
 测试还验证 UDP 域名缓存的不同端口转发、固定过期、容量淘汰和失败重解析；受控解析器确认同一域名连续发送 100 个数据报只调用一次解析器。故障注入程序先模拟连接中断与资源不足，再执行 TCP/UDP 和 IPv6 端到端测试，验证监听服务能够恢复。GitHub Actions 的三个系统均执行这些检查。
 
