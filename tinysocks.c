@@ -214,15 +214,15 @@ static int wait_for_io(socket_t fd, short events, uint64_t deadline_ms) {
     }
 }
 
-/* UDP control bytes are ignored; use a separate buffer from the pending datagram. */
-static int udp_control_open(socket_t client, uint64_t deadline_ms) {
+/* Ignore a finite receive-queue snapshot before yielding to other work. */
+static int udp_control_open_buffered(socket_t client, uint64_t deadline_ms,
+                                      char *ignored, size_t capacity) {
     if (client == INVALID_FD) return 1;
-    char ignored[1024];
-    size_t pending = sizeof(ignored);
+    size_t pending = capacity;
     int snapshotted = 0;
     while (remaining_milliseconds(deadline_ms)) {
         int peek = snapshotted && pending == 0;
-        size_t length = peek ? 1 : pending < sizeof(ignored) ? pending : sizeof(ignored);
+        size_t length = peek ? 1 : pending < capacity ? pending : capacity;
         int count = recv(client, ignored, (int)length, peek ? MSG_PEEK : 0);
         if (count == 0) return 0;
         if (count < 0) {
@@ -256,6 +256,12 @@ static int udp_control_open(socket_t client, uint64_t deadline_ms) {
         }
     }
     return 0;
+}
+
+/* DNS checks must preserve the datagram already waiting in the packet buffer. */
+static int udp_control_open(socket_t client, uint64_t deadline_ms) {
+    char ignored[1024];
+    return udp_control_open_buffered(client, deadline_ms, ignored, sizeof(ignored));
 }
 
 /* FIN is valid for TCP, and queued payload belongs to the relay. Some
@@ -1191,7 +1197,8 @@ static void udp_associate(socket_t client, unsigned short requested_port) {
         if (ready == 0) break;
         if (readable[0].revents) {
             /* The TCP control connection defines the association lifetime. */
-            if (!udp_control_open(client, deadline_ms)) break;
+            if (!udp_control_open_buffered(client, deadline_ms, (char *)packet,
+                                           sizeof(packet))) break;
         }
         if (readable[1].revents) {
             struct sockaddr_storage source;
