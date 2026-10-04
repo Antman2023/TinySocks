@@ -558,7 +558,8 @@ static int send_all(socket_t fd, const unsigned char *data, size_t length,
         data += n;
         length -= (size_t)n;
     }
-    return 1;
+    /* The final successful syscall may return after a delayed resumption. */
+    return remaining_milliseconds(deadline_ms) != 0;
 }
 
 static int recv_all(socket_t fd, unsigned char *data, size_t length,
@@ -577,7 +578,8 @@ static int recv_all(socket_t fd, unsigned char *data, size_t length,
         data += n;
         length -= (size_t)n;
     }
-    return 1;
+    /* Completed request bytes must not renew an already expired budget. */
+    return remaining_milliseconds(deadline_ms) != 0;
 }
 
 static int send_reply(socket_t client, unsigned char status, socket_t outbound) {

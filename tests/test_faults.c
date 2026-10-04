@@ -182,6 +182,10 @@ static atomic_uint clock_advance_seconds = ATOMIC_VAR_INIT(0);
 static _Atomic(socket_t) expired_poll_control = ATOMIC_VAR_INIT(INVALID_FD);
 static int expire_connect_ready, expire_connect_result;
 static socket_t expired_connect_socket = INVALID_FD;
+/* Internal I/O fixtures run synchronously, without background workers. */
+static socket_t deadline_io_socket = INVALID_FD;
+static unsigned int deadline_io_recv_bytes, deadline_io_send_bytes;
+static unsigned int deadline_io_advance, deadline_io_triggers, deadline_io_connects;
 #if defined(_WIN32) || defined(__APPLE__)
 static atomic_int udp_binding_failure = ATOMIC_VAR_INIT(0);
 static socket_t failed_udp_binding_socket = INVALID_FD;
@@ -396,6 +400,20 @@ static void set_test_error(int error) {
 #endif
 }
 
+static void advance_after_io(socket_t fd, int count, int sending) {
+    if (fd != deadline_io_socket || count <= 0) return;
+    unsigned int *pending = sending ? &deadline_io_send_bytes : &deadline_io_recv_bytes;
+    if (!*pending) return;
+    if ((unsigned int)count < *pending) {
+        *pending -= (unsigned int)count;
+        return;
+    }
+    *pending = 0;
+    ++deadline_io_triggers;
+    /* The real syscall succeeded; model resuming after its caller's budget. */
+    atomic_store_explicit(&clock_advance_seconds, deadline_io_advance, memory_order_relaxed);
+}
+
 #ifdef _WIN32
 static int injected_recv(SOCKET fd, char *buffer, int length, int flags) {
 #else
@@ -431,7 +449,11 @@ static ssize_t injected_recv(int fd, void *buffer, size_t length, int flags) {
         }
         return n;
     }
-    if (fd != continuous_control) return recv(fd, buffer, length, flags);
+    if (fd != continuous_control) {
+        int n = (int)recv(fd, buffer, length, flags);
+        if (!flags) advance_after_io(fd, n, 0);
+        return n;
+    }
     if (!(flags & MSG_PEEK)) {
         ++continuous_reads;
         retry_pause(1);
@@ -445,7 +467,11 @@ static int injected_send(SOCKET fd, const char *buffer, int length, int flags) {
 #else
 static ssize_t injected_send(int fd, const void *buffer, size_t length, int flags) {
 #endif
-    if (!tcp_io.enabled) return send(fd, buffer, length, flags);
+    if (!tcp_io.enabled) {
+        int n = (int)send(fd, buffer, length, flags);
+        advance_after_io(fd, n, 1);
+        return n;
+    }
     ++tcp_io.sends;
     if (tcp_io.sends % 17 == 0) {
         ++tcp_io.send_interrupts;
@@ -595,6 +621,7 @@ static int injected_connect(SOCKET fd, const struct sockaddr *address, int lengt
 #else
 static int injected_connect(int fd, const struct sockaddr *address, socklen_t length) {
 #endif
+    if (deadline_io_socket != INVALID_FD) ++deadline_io_connects;
     if (!fake_connect) return connect(fd, address, length);
     assert(connect_calls < CONNECT_PENDING_LIMIT);
     connect_families[connect_calls++] = address->sa_family;
@@ -1199,6 +1226,97 @@ static void control_pair(socket_t pair[2]) {
     pair[0] = accept(listener, NULL, NULL);
     assert(pair[0] != INVALID_FD && set_nonblocking(pair[0], 1));
     close_socket(listener);
+}
+
+static void test_io_completion_deadlines(void) {
+#ifdef _WIN32
+    WSADATA winsock;
+    assert(WSAStartup(MAKEWORD(2, 2), &winsock) == 0);
+#endif
+    /* Keep this target port reserved but not listening: a permitted CONNECT
+       must attempt it and return refusal, without waiting in the relay. */
+    socket_t target = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    assert(target != INVALID_FD);
+    struct sockaddr_in local = {0};
+    local.sin_family = AF_INET;
+    local.sin_addr.s_addr = htonl(TEST_LOOPBACK_IP);
+    assert(bind(target, (struct sockaddr *)&local, sizeof(local)) == 0);
+    socklen_t length = sizeof(local);
+    assert(getsockname(target, (struct sockaddr *)&local, &length) == 0);
+    unsigned short port = ntohs(local.sin_port);
+    for (int command = 1; command <= 3; command += 2) {
+        for (int expired = 0; expired <= 1; ++expired) {
+            socket_t control[2];
+            control_pair(control);
+            const unsigned char request[] = {
+                5, 1, 0, 5, (unsigned char)command, 0, 1, 127, 0, 0, 1,
+                (unsigned char)(port >> 8), (unsigned char)port
+            };
+            assert(send(control[1], (const char *)request, sizeof(request), 0) == sizeof(request));
+#ifdef _WIN32
+            assert(shutdown(control[1], SD_SEND) == 0);
+#else
+            assert(shutdown(control[1], SHUT_WR) == 0);
+#endif
+            deadline_io_socket = control[0];
+            deadline_io_recv_bytes = sizeof(request); /* Expire at the final port byte. */
+            deadline_io_send_bytes = deadline_io_triggers = deadline_io_connects = 0;
+            deadline_io_advance = expired ? HANDSHAKE_TIMEOUT_SECONDS + 1 : 0;
+            handle_client(control[0]); /* Owns and closes the accepted socket. */
+            deadline_io_socket = INVALID_FD;
+            unsigned char reply[12];
+            int count = 0, received;
+            while ((received = recv(control[1], (char *)reply + count,
+                                     sizeof(reply) - count, 0)) > 0) {
+                count += received;
+                if (count == sizeof(reply)) break;
+            }
+            printf("Handshake completion: command=%d expired=%d connects=%u reply_bytes=%d\n",
+                   command, expired, deadline_io_connects, count);
+            fflush(stdout);
+            assert(deadline_io_triggers == 1);
+            assert(count >= 2 && reply[0] == 5 && reply[1] == 0);
+            assert(deadline_io_connects == (unsigned int)(!expired && command == 1));
+            assert(count == (expired ? 2 : 12));
+            if (!expired) assert(reply[2] == 5 && (command == 1 ? reply[3] != 0 : reply[3] == 0));
+            close_socket(control[1]);
+            atomic_store_explicit(&clock_advance_seconds, 0, memory_order_relaxed);
+        }
+    }
+    close_socket(target);
+
+    for (int sending = 0; sending <= 1; ++sending) {
+        for (int expired = 0; expired <= 1; ++expired) {
+            socket_t control[2];
+            control_pair(control);
+            const unsigned char payload[] = "completion bytes";
+            unsigned char received[sizeof(payload)];
+            if (!sending)
+                assert(send(control[1], (const char *)payload, sizeof(payload), 0) == sizeof(payload));
+            deadline_io_socket = control[0];
+            deadline_io_recv_bytes = sending ? 0 : sizeof(payload);
+            deadline_io_send_bytes = sending ? sizeof(payload) : 0;
+            deadline_io_triggers = 0;
+            deadline_io_advance = expired ? HANDSHAKE_TIMEOUT_SECONDS + 1 : 0;
+            uint64_t deadline_ms = monotonic_milliseconds() + 1000;
+            int result = sending ? send_all(control[0], payload, sizeof(payload), deadline_ms) :
+                                   recv_all(control[0], received, sizeof(received), deadline_ms);
+            deadline_io_socket = INVALID_FD;
+            printf("I/O completion: sending=%d expired=%d result=%d\n", sending, expired, result);
+            fflush(stdout);
+            assert(deadline_io_triggers == 1 && result == !expired);
+            if (sending)
+                assert(recv_all(control[1], received, sizeof(received), monotonic_milliseconds() + 1000));
+            assert(!memcmp(payload, received, sizeof(payload)));
+            close_socket(control[0]);
+            close_socket(control[1]);
+            atomic_store_explicit(&clock_advance_seconds, 0, memory_order_relaxed);
+        }
+    }
+#ifdef _WIN32
+    WSACleanup();
+#endif
+    puts("I/O completion checks passed (original deadlines, final receive/send, no late TCP/UDP setup, valid requests, intact bytes).");
 }
 
 #ifdef _WIN32
@@ -2309,6 +2427,7 @@ int main(int argc, char **argv) {
     }
     if (argc == 2 && !strcmp(argv[1], "--test-internals")) {
         setvbuf(stdout, NULL, _IOLBF, 0);
+        test_io_completion_deadlines();
         test_dns_cache();
         puts("UDP DNS checks passed (100 literals, zero resolutions; 100 case variants, one resolution; syntax, TTL, ports, failures).");
         test_udp_destination_lifetime();
