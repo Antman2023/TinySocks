@@ -82,7 +82,7 @@ $(HOST_OUTPUT): tinysocks.c Makefile
 	$(ZIG) cc $(HOST_FLAGS) tinysocks.c -o $@ $(HOST_LIBS)
 
 dist:
-	$(PYTHON) -c "from pathlib import Path; Path('dist').mkdir(exist_ok=True)"
+	mkdir dist
 
 $(RELEASE_OUTPUTS): tinysocks.c Makefile | dist
 
