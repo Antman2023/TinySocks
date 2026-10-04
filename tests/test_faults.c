@@ -25,6 +25,8 @@ static int injected_getaddrinfo(const char *, const char *, const struct addrinf
                                 struct addrinfo **);
 static void injected_freeaddrinfo(struct addrinfo *);
 static void *injected_calloc(size_t, size_t);
+static void *injected_malloc(size_t);
+static void injected_free(void *);
 #ifdef _WIN32
 static SOCKET injected_accept(SOCKET, struct sockaddr *, int *);
 static int injected_connect(SOCKET, const struct sockaddr *, int);
@@ -61,6 +63,8 @@ static int injected_pthread_create(pthread_t *, const pthread_attr_t *,
 #define connect injected_connect
 #define getsockopt injected_getsockopt
 #define calloc injected_calloc
+#define malloc injected_malloc
+#define free injected_free
 #define recv injected_recv
 #ifdef _WIN32
 #define setsockopt injected_setsockopt
@@ -91,6 +95,8 @@ static int injected_pthread_create(pthread_t *, const pthread_attr_t *,
 #undef connect
 #undef getsockopt
 #undef calloc
+#undef malloc
+#undef free
 #undef recv
 #ifdef _WIN32
 #undef setsockopt
@@ -129,6 +135,12 @@ static atomic_uint held_dns_calls = ATOMIC_VAR_INIT(0);
 static atomic_uint held_dns_freed = ATOMIC_VAR_INIT(0);
 static _Atomic(struct addrinfo *) held_results[MAX_RESOLVERS];
 static int resolver_setup_failure;
+/* Private CLI mode: only the accept thread owns these failure-phase fields. */
+static int fail_client_setup;
+static unsigned int failed_client_allocations, failed_client_threads;
+static socket_t accepted_client = INVALID_FD, failed_client = INVALID_FD;
+static void *failed_client_argument;
+static int check_client_rollback;
 /* Only the chosen control socket has a continuously replenished receive queue. */
 static socket_t continuous_control = INVALID_FD;
 static unsigned int continuous_reads;
@@ -167,6 +179,39 @@ static void *injected_calloc(size_t count, size_t size) {
     return calloc(count, size);
 }
 
+static void *injected_malloc(size_t size) {
+    if (fail_client_setup && failed_client_allocations < 3) {
+        ++failed_client_allocations;
+        failed_client = accepted_client;
+        check_client_rollback = 1;
+        fprintf(stderr, "Fault client setup: allocation %u\n", failed_client_allocations);
+        fflush(stderr);
+        return NULL;
+    }
+    void *argument = malloc(size);
+    if (fail_client_setup && failed_client_threads < 3) {
+        assert(argument != NULL);
+        failed_client_argument = argument;
+    }
+    return argument;
+}
+
+static void injected_free(void *argument) {
+    if (argument && argument == failed_client_argument) failed_client_argument = NULL;
+    free(argument);
+}
+
+static int fail_client_thread(void *argument) {
+    if (!fail_client_setup || failed_client_threads >= 3) return 0;
+    assert(argument == failed_client_argument);
+    failed_client = *(socket_t *)argument;
+    check_client_rollback = 1;
+    ++failed_client_threads;
+    fprintf(stderr, "Fault client setup: thread %u\n", failed_client_threads);
+    fflush(stderr);
+    return 1;
+}
+
 #ifdef _WIN32
 static HANDLE injected_create_event(LPSECURITY_ATTRIBUTES attributes, BOOL manual_reset,
                                      BOOL initial_state, LPCSTR name) {
@@ -179,6 +224,10 @@ static HANDLE injected_create_event(LPSECURITY_ATTRIBUTES attributes, BOOL manua
 static HANDLE injected_create_thread(LPSECURITY_ATTRIBUTES attributes, SIZE_T stack_size,
                                       LPTHREAD_START_ROUTINE start, LPVOID argument,
                                       DWORD flags, LPDWORD thread_id) {
+    if (start == client_thread && fail_client_thread(argument)) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
     if (resolver_setup_failure == 3 && start == resolver_thread) return NULL;
     return CreateThread(attributes, stack_size, start, argument, flags, thread_id);
 }
@@ -213,6 +262,7 @@ static int injected_pipe(int *fds) {
 
 static int injected_pthread_create(pthread_t *thread, const pthread_attr_t *attributes,
                                     void *(*start)(void *), void *argument) {
+    if (start == client_thread && fail_client_thread(argument)) return EAGAIN;
     if (resolver_setup_failure == 3 && start == resolver_thread) return EAGAIN;
     return pthread_create(thread, attributes, start, argument);
 }
@@ -535,7 +585,28 @@ static int injected_accept(int listener, struct sockaddr *address, socklen_t *le
     };
 #endif
     static unsigned int calls;
-    if (calls < sizeof(errors) / sizeof(errors[0])) {
+    if (check_client_rollback) {
+        assert(atomic_load_explicit(&active_clients, memory_order_relaxed) == 0);
+        assert(failed_client_argument == NULL);
+        assert(failed_client != INVALID_FD);
+        int type;
+#ifdef _WIN32
+        int size = sizeof(type);
+        assert(getsockopt(failed_client, SOL_SOCKET, SO_TYPE, (char *)&type, &size) == SOCKET_ERROR);
+        assert(WSAGetLastError() == WSAENOTSOCK);
+#else
+        socklen_t size = sizeof(type);
+        assert(getsockopt(failed_client, SOL_SOCKET, SO_TYPE, &type, &size) == -1);
+        assert(errno == EBADF);
+#endif
+        failed_client = INVALID_FD;
+        check_client_rollback = 0;
+        if (failed_client_threads == 3) {
+            fputs("Fault client setup: recovered\n", stderr);
+            fflush(stderr);
+        }
+    }
+    if (!fail_client_setup && calls < sizeof(errors) / sizeof(errors[0])) {
         int error = errors[calls++];
 #ifdef _WIN32
         WSASetLastError(error);
@@ -544,7 +615,9 @@ static int injected_accept(int listener, struct sockaddr *address, socklen_t *le
 #endif
         return INVALID_FD;
     }
-    return accept(listener, address, length);
+    socket_t client = accept(listener, address, length);
+    if (fail_client_setup) accepted_client = client;
+    return client;
 }
 
 static int domain_request(const char *host, unsigned short port, socket_t *ipv4,
@@ -1727,6 +1800,12 @@ static void test_connection_fallback(void) {
 }
 
 int main(int argc, char **argv) {
+    if (argc > 1 && !strcmp(argv[1], "--fail-client-setup")) {
+        fail_client_setup = 1;
+        --argc;
+        for (int i = 1; i < argc; ++i) argv[i] = argv[i + 1];
+        argv[argc] = NULL;
+    }
     if (argc == 2 && !strcmp(argv[1], "--test-internals")) {
         setvbuf(stdout, NULL, _IOLBF, 0);
         test_dns_cache();

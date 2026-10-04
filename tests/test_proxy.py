@@ -59,6 +59,7 @@ def read_reply(sock):
 
 class ProxyTestCase(unittest.TestCase):
     listen_host = "127.0.0.1"
+    proxy_arguments = ()
 
     def setUp(self):
         if ":" in self.listen_host:
@@ -68,7 +69,7 @@ class ProxyTestCase(unittest.TestCase):
             except OSError:
                 self.skipTest("IPv6 loopback is unavailable")
         self.proxy = subprocess.Popen(
-            [str(BINARY), self.listen_host, "0"],
+            [str(BINARY), *self.proxy_arguments, self.listen_host, "0"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
@@ -113,6 +114,46 @@ class ProxyTestCase(unittest.TestCase):
             self.assertEqual(sock.recv(1), b"")
         except ConnectionError:
             pass
+
+
+@unittest.skipUnless(FAULTS_ENABLED, "requires the fault-injection binary (--faults)")
+class FaultClientSetupTests(ProxyTestCase):
+    proxy_arguments = ("--fail-client-setup",)
+
+    def test_failed_setup_releases_resources_and_backs_off(self):
+        started = time.monotonic()
+        for _ in range(6):
+            with socket.create_connection((self.listen_host, self.port), 2) as failed:
+                failed.settimeout(2)
+                self.assert_closed(failed)
+        with self.control() as first, self.control() as second:
+            elapsed = time.monotonic() - started
+            # Six resource failures must pause rather than spin through accepts.
+            self.assertGreaterEqual(elapsed, 0.5)
+            with socket.socket() as listener:
+                listener.bind(("127.0.0.1", 0))
+                listener.listen()
+                listener.settimeout(2)
+                first.sendall(b"\x05\x01\x00" + encode_address(
+                    "127.0.0.1", listener.getsockname()[1]) + b"recovered request")
+                self.assertEqual(read_reply(first)[0][:3], b"\x05\x00\x00")
+                with listener.accept()[0] as target:
+                    target.settimeout(2)
+                    self.assertEqual(recv_exact(target, 17), b"recovered request")
+                    target.sendall(b"recovered reply")
+                    self.assertEqual(recv_exact(first, 15), b"recovered reply")
+                self.assertIsNone(self.proxy.poll())
+        # The native fixture asserts each socket, argument and slot was released.
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            try:
+                lines = pool.submit(lambda: [self.proxy.stderr.readline().strip()
+                                             for _ in range(7)]).result(timeout=2)
+            except BaseException:
+                self.stop_proxy()
+                raise
+        self.assertEqual(lines, [f"Fault client setup: allocation {i}" for i in range(1, 4)]
+                         + [f"Fault client setup: thread {i}" for i in range(1, 4)]
+                         + ["Fault client setup: recovered"])
 
 
 class CommandLineTests(unittest.TestCase):

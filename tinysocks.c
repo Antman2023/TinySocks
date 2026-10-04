@@ -1460,6 +1460,7 @@ int main(int argc, char **argv) {
         if (!argument) {
             close_socket(client);
             atomic_fetch_sub_explicit(&active_clients, 1, memory_order_relaxed);
+            retry_pause(100);
             continue;
         }
         *argument = client;
@@ -1470,6 +1471,7 @@ int main(int argc, char **argv) {
             free(argument);
             close_socket(client);
             atomic_fetch_sub_explicit(&active_clients, 1, memory_order_relaxed);
+            retry_pause(100);
         }
 #else
         pthread_t thread;
@@ -1479,6 +1481,7 @@ int main(int argc, char **argv) {
             free(argument);
             close_socket(client);
             atomic_fetch_sub_explicit(&active_clients, 1, memory_order_relaxed);
+            retry_pause(100);
         }
 #endif
     }
