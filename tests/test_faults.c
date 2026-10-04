@@ -407,13 +407,16 @@ static void test_dns_cache(void) {
 
     const char *fallback_hosts[] = {
         "127.1", "2130706433", "0177.0.0.1", "0x7f.0.0.1", "127.000.000.001",
-        "::ffff:127.0.0.01", "[::1]", "fe80::1%1", "localhost", "", "127.0.0.256"
+        "::ffff:127.0.0.01", "::ffff:127.1", "::ffff:2130706433", "[::1]",
+        "fe80::1%1", "localhost", "", "127.0.0.256", "127.0.0.1.", "127.0.0.1 "
     };
     struct sockaddr_storage untouched, parsed;
     memset(&untouched, 0xa5, sizeof(untouched));
     for (unsigned int i = 0; i < sizeof(fallback_hosts) / sizeof(fallback_hosts[0]); ++i) {
         parsed = untouched;
-        assert(!parse_numeric_host(fallback_hosts[i], &parsed));
+        int numeric = parse_numeric_host(fallback_hosts[i], &parsed);
+        if (numeric) fprintf(stderr, "Unexpected literal conversion: %s\n", fallback_hosts[i]);
+        assert(!numeric);
         assert(memcmp(&parsed, &untouched, sizeof(parsed)) == 0);
     }
     assert(parse_numeric_host("0000:0000:0000:0000:0000:0000:0000:0001", &parsed));

@@ -730,23 +730,43 @@ static void normalize_ipv4_mapped(struct sockaddr_storage *address) {
     }
 }
 
+static int canonical_ipv4_text(const char *host) {
+    const char *p = host;
+    for (unsigned int part = 0; part < 4; ++part) {
+        if (*p < '0' || *p > '9') return 0;
+        if (*p == '0' && p[1] >= '0' && p[1] <= '9') return 0;
+        unsigned int value = 0;
+        do {
+            value = value * 10 + (unsigned int)(*p++ - '0');
+            if (value > 255) return 0;
+        } while (*p >= '0' && *p <= '9');
+        if (part == 3) return *p == '\0';
+        if (*p != '.') return 0;
+        ++p;
+    }
+    return 0;
+}
+
 /* Convert standard IP literals without changing the system's legacy/scoped parsing. */
 static int parse_numeric_host(const char *host, struct sockaddr_storage *address) {
-    const char *dotted = strrchr(host, ':');
-    dotted = dotted ? dotted + 1 : host;
-    if (strchr(dotted, '.'))
-        for (const char *p = dotted; *p; ++p)
-            if ((p == dotted || p[-1] == '.') && *p == '0' &&
-                p[1] >= '0' && p[1] <= '9') return 0;
+    const char *last_colon = strrchr(host, ':');
+    if (last_colon) {
+        for (const char *p = host; *p; ++p)
+            if (*p != ':' && *p != '.' && !(*p >= '0' && *p <= '9') &&
+                !(*p >= 'a' && *p <= 'f') && !(*p >= 'A' && *p <= 'F')) return 0;
+        if (strchr(host, '.') && !canonical_ipv4_text(last_colon + 1)) return 0;
+    } else if (!canonical_ipv4_text(host)) {
+        return 0;
+    }
     struct sockaddr_in ipv4 = {0};
     struct sockaddr_in6 ipv6 = {0};
-    if (inet_pton(AF_INET, host, &ipv4.sin_addr) == 1) {
+    if (!last_colon && inet_pton(AF_INET, host, &ipv4.sin_addr) == 1) {
         ipv4.sin_family = AF_INET;
         memset(address, 0, sizeof(*address));
         memcpy(address, &ipv4, sizeof(ipv4));
         return 1;
     }
-    if (inet_pton(AF_INET6, host, &ipv6.sin6_addr) == 1) {
+    if (last_colon && inet_pton(AF_INET6, host, &ipv6.sin6_addr) == 1) {
         ipv6.sin6_family = AF_INET6;
         memset(address, 0, sizeof(*address));
         memcpy(address, &ipv6, sizeof(ipv6));
