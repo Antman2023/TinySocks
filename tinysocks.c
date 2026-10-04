@@ -169,6 +169,18 @@ static int remaining_milliseconds(uint64_t deadline_ms) {
     return remaining > INT_MAX ? INT_MAX : (int)remaining;
 }
 
+/* Winsock must reserve receiving endpoints before explicit or implicit bind. */
+static int set_exclusive_address_use(socket_t fd) {
+#ifdef _WIN32
+    int exclusive = 1;
+    return setsockopt(fd, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+                      (const char *)&exclusive, sizeof(exclusive)) == 0;
+#else
+    (void)fd;
+    return 1;
+#endif
+}
+
 static int set_nonblocking(socket_t fd, int enabled) {
 #ifdef _WIN32
     u_long mode = enabled ? 1 : 0;
@@ -993,7 +1005,8 @@ static int send_udp_request(const unsigned char *payload, size_t length,
     socket_t *outbound = destination->ss_family == AF_INET ? ipv4 : ipv6;
     if (*outbound == INVALID_FD) {
         *outbound = socket(destination->ss_family, SOCK_DGRAM, IPPROTO_UDP);
-        if (*outbound != INVALID_FD && !set_nonblocking(*outbound, 1)) {
+        if (*outbound != INVALID_FD &&
+            (!set_exclusive_address_use(*outbound) || !set_nonblocking(*outbound, 1))) {
             close_socket(*outbound);
             *outbound = INVALID_FD;
         }
@@ -1171,6 +1184,7 @@ static void udp_associate(socket_t client, unsigned short requested_port) {
     set_address_port(&local, 0);
     association = socket(local.ss_family, SOCK_DGRAM, IPPROTO_UDP);
     if (association == INVALID_FD ||
+        !set_exclusive_address_use(association) ||
         bind(association, (struct sockaddr *)&local, address_length(&local)) != 0 ||
         !set_nonblocking(association, 1))
         goto failed;
@@ -1392,9 +1406,7 @@ int main(int argc, char **argv) {
         if (fd == INVALID_FD) continue;
 #ifdef _WIN32
         /* A wildcard listener must not be shadowed by another local bind. */
-        int exclusive = 1;
-        if (setsockopt(fd, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
-                       (const char *)&exclusive, sizeof(exclusive)) != 0) {
+        if (!set_exclusive_address_use(fd)) {
             close_socket(fd);
             continue;
         }

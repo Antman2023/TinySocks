@@ -1296,5 +1296,93 @@ class WildcardIPv6ListenerTests(WildcardListenerTests):
     family = socket.AF_INET6
 
 
+@unittest.skipUnless(sys.platform == "win32", "requires Windows exclusive UDP binding")
+class WindowsUDPBindingTests(ProxyTestCase):
+    def check_competing_udp_binds(self, family, endpoint, include_wildcard=True):
+        wildcard = "::" if family == socket.AF_INET6 else "0.0.0.0"
+        hosts = (wildcard, endpoint[0]) if include_wildcard else (endpoint[0],)
+        for host in hosts:
+            for reuse in (False, True):
+                with self.subTest(host=host, reuse=reuse), \
+                     socket.socket(family, socket.SOCK_DGRAM) as contender:
+                    if reuse:
+                        contender.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    with self.assertRaises(OSError) as rejected:
+                        contender.bind((host, endpoint[1]))
+                    self.assertIn(rejected.exception.errno, (errno.EACCES, errno.EADDRINUSE,
+                                                            10013, 10048))
+
+    def check_outbound_binding(self, family, host):
+        with self.control() as control, \
+             socket.socket(family, socket.SOCK_DGRAM) as target, \
+             socket.socket(socket.AF_INET6 if ":" in self.listen_host else socket.AF_INET,
+                           socket.SOCK_DGRAM) as client:
+            try:
+                target.bind((host, 0))
+            except OSError:
+                if family == socket.AF_INET6:
+                    self.skipTest("IPv6 loopback is unavailable")
+                raise
+            target.settimeout(2)
+            client.settimeout(2)
+            relay = self.associate(control)
+            header = bytes(3) + encode_address(host, target.getsockname()[1])
+            client.sendto(header + b"request", relay)
+            payload, outbound = target.recvfrom(100)
+            self.assertEqual(payload, b"request")
+            self.check_competing_udp_binds(family, outbound)
+            for payload in (b"", b"reply after competing binds"):
+                target.sendto(payload, outbound)
+                self.assertEqual(client.recvfrom(100)[0], header + payload)
+            client.sendto(header + b"next request", relay)
+            self.assertEqual(target.recvfrom(100), (b"next request", outbound))
+
+    def test_ipv4_udp_outbound_is_exclusive(self):
+        self.check_outbound_binding(socket.AF_INET, "127.0.0.1")
+
+    def test_ipv6_udp_outbound_is_exclusive(self):
+        self.check_outbound_binding(socket.AF_INET6, "::1")
+
+    def test_udp_association_is_exclusive(self):
+        family = socket.AF_INET6 if ":" in self.listen_host else socket.AF_INET
+        with self.control() as control, \
+             socket.socket(family, socket.SOCK_DGRAM) as client, \
+             socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as target:
+            relay = self.associate(control)
+            self.check_competing_udp_binds(family, relay, include_wildcard=False)
+            target.bind(("127.0.0.1", 0))
+            target.settimeout(2)
+            client.settimeout(2)
+            wildcard = "::" if family == socket.AF_INET6 else "0.0.0.0"
+            for reuse in (False, True):
+                # A wildcard bind may cover other interfaces; it must not steal
+                # traffic from the association's exclusive concrete endpoint.
+                with self.subTest(reuse=reuse), socket.socket(family, socket.SOCK_DGRAM) as contender:
+                    if reuse:
+                        contender.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    bound = False
+                    try:
+                        contender.bind((wildcard, relay[1]))
+                        bound = True
+                    except OSError as rejected:
+                        self.assertIn(rejected.errno, (errno.EACCES, errno.EADDRINUSE, 10013, 10048))
+                    payload = b"association" + bytes([reuse])
+                    request = bytes(3) + encode_address(*target.getsockname()) + payload
+                    client.sendto(request, relay)
+                    readable = [target, contender] if bound else [target]
+                    ready = select.select(readable, [], [], 2)[0]
+                    self.assertIn(target, ready)
+                    if bound:
+                        self.assertNotIn(contender, ready)
+                    echoed, outbound = target.recvfrom(100)
+                    self.assertEqual(echoed, payload)
+                    target.sendto(payload, outbound)
+                    self.assertEqual(client.recvfrom(100)[0], request)
+
+
+class WindowsUDPIPv6BindingTests(WindowsUDPBindingTests):
+    listen_host = "::1"
+
+
 if __name__ == "__main__":
     unittest.main()

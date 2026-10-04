@@ -63,7 +63,8 @@ test: $(TEST_OUTPUT) $(FAULT_TEST_OUTPUT)
 	$(PYTHON) tests/test_proxy.py ./$(FAULT_TEST_OUTPUT) --faults FaultProxyTests \
 		ProxyTests.test_domain_connect_and_pipelined_payload \
 		ProxyTests.test_udp_domain_and_empty_payload IPv6ProxyTests \
-		WildcardListenerTests WildcardIPv6ListenerTests -v
+		WildcardListenerTests WildcardIPv6ListenerTests \
+		WindowsUDPBindingTests WindowsUDPIPv6BindingTests -v
 
 $(FAULT_TEST_OUTPUT): tests/test_faults.c tinysocks.c Makefile
 	$(ZIG) cc $(HOST_FLAGS) -DMAX_CLIENTS=2 \

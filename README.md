@@ -79,7 +79,7 @@ tinysocks [监听地址 [端口]]
 
 默认监听 `0.0.0.0:1080`。例如，仅允许本机连接时运行 `tinysocks 127.0.0.1 1080`。
 
-Windows 监听套接字在绑定前启用 `SO_EXCLUSIVEADDRUSE`，保护监听地址和端口，避免其他本地监听套接字接走该端点的连接；请求独占绑定失败时不会继续使用该套接字。Windows 的通配地址监听也会拒绝在已被其他监听程序占用的端口上启动。Linux 和 macOS 使用 `SO_REUSEADDR` 支持正常重启。绑定规则详见 [Windows 套接字文档](https://learn.microsoft.com/en-us/windows/win32/winsock/using-so-reuseaddr-and-so-exclusiveaddruse)。
+Windows 的 TCP 监听、UDP 关联端口及 UDP 出站套接字均在绑定前启用 `SO_EXCLUSIVEADDRUSE`，保护接收端点，避免其他本地套接字接走连接或目标回复；出站 UDP 在首次发送触发隐式绑定前完成该配置。配置失败时立即关闭新套接字；UDP 关联建立失败返回状态 `1`，出站配置失败则丢弃本次请求，不写入目标许可或 DNS 缓存，也不锁定客户端端口，后续请求可重新建立套接字。Windows 的通配地址监听也会拒绝在已被其他监听程序占用的端口上启动。Linux 和 macOS 的 TCP 监听使用 `SO_REUSEADDR` 支持正常重启。绑定规则详见 [Windows 套接字文档](https://learn.microsoft.com/en-us/windows/win32/winsock/using-so-reuseaddr-and-so-exclusiveaddruse)。
 
 macOS 的通配地址与具体地址允许同账户下通过 `SO_REUSEADDR` 重叠绑定，不能据此提供 Windows 的独占保证；需要避免这类端点重叠时，请指定具体监听地址。该行为由 [XNU 的绑定检查](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/netinet/in_pcb.c)决定。
 
@@ -150,3 +150,5 @@ Linux CI 还使用 Clang 的 AddressSanitizer 和 UndefinedBehaviorSanitizer 执
 UDP 回复来源检查使用 65 个真实回环目标端口和受控单调时钟，验证未访问端口、过期及容量淘汰的目标回复被丢弃。成功请求可以更新目标许可，回复和发送失败均不能延长许可；刷新已有目标不能挤掉其他目标。允许的回复还须保留来源地址、端口和载荷。这些检查随内部测试在三个系统及 Linux 内存检查任务中执行，无需等待真实的 60 秒期限。
 
 IPv4/IPv6 通配监听回归分别使用默认选项和 `SO_REUSEADDR`，检查已有监听端点不能被重复监听；失败尝试后仍须完成真实 TCP 请求、回复和双向半关闭。Windows 和 Linux 还检查回环地址不能覆盖通配监听，以及已有回环监听占用端口时代理不能作为通配监听启动。macOS 按系统支持的重复通配端点规则检查，跳过其允许的通配/具体地址复用断言。这些检查也覆盖正式附件和故障程序。
+
+Windows UDP 回归在 IPv4/IPv6 控制连接下分别检查两种出站地址族的端口及关联端口，尝试默认选项和 `SO_REUSEADDR` 的竞争绑定，再验证空载荷、完整回复和后续请求仍通过原出站端口转发。关联端口绑定于具体地址时，系统可以允许通配绑定服务其他接口；检查会保持竞争套接字打开，确认它无法接走当前关联的数据。这些检查覆盖正式附件和故障程序。Windows 内部检查另模拟独占配置返回 `WSAENOBUFS` 或 `WSAEACCES`，验证失败套接字已关闭、请求未转发、许可与缓存未写入，以及重新解析、重试和新 UDP 关联能恢复。

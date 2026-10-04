@@ -30,6 +30,7 @@ static SOCKET injected_accept(SOCKET, struct sockaddr *, int *);
 static int injected_connect(SOCKET, const struct sockaddr *, int);
 static int injected_close(SOCKET);
 static int injected_getsockopt(SOCKET, int, int, char *, int *);
+static int injected_setsockopt(SOCKET, int, int, const char *, int);
 static int injected_recv(SOCKET, char *, int, int);
 static int injected_ioctlsocket(SOCKET, long, u_long *);
 static int injected_wsa_poll(WSAPOLLFD *, ULONG, INT);
@@ -62,6 +63,7 @@ static int injected_pthread_create(pthread_t *, const pthread_attr_t *,
 #define calloc injected_calloc
 #define recv injected_recv
 #ifdef _WIN32
+#define setsockopt injected_setsockopt
 #define ioctlsocket injected_ioctlsocket
 #define WSAPoll injected_wsa_poll
 #define GetTickCount64 injected_tick_count
@@ -91,6 +93,7 @@ static int injected_pthread_create(pthread_t *, const pthread_attr_t *,
 #undef calloc
 #undef recv
 #ifdef _WIN32
+#undef setsockopt
 #undef ioctlsocket
 #undef WSAPoll
 #undef GetTickCount64
@@ -137,6 +140,8 @@ static _Atomic(socket_t) expired_poll_control = ATOMIC_VAR_INIT(INVALID_FD);
 static int expire_connect_ready, expire_connect_result;
 static socket_t expired_connect_socket = INVALID_FD;
 #ifdef _WIN32
+static atomic_int udp_binding_failure = ATOMIC_VAR_INIT(0);
+static socket_t failed_udp_binding_socket = INVALID_FD;
 static HANDLE failed_resolver_event;
 static WSAEVENT failed_control_event;
 #else
@@ -234,6 +239,24 @@ static ssize_t injected_recv(int fd, void *buffer, size_t length, int flags) {
     memset(buffer, 'c', (size_t)length);
     return length;
 }
+
+#ifdef _WIN32
+static int injected_setsockopt(SOCKET fd, int level, int option, const char *value, int length) {
+    if (level == SOL_SOCKET && option == SO_EXCLUSIVEADDRUSE &&
+        atomic_load_explicit(&udp_binding_failure, memory_order_relaxed)) {
+        int type;
+        socklen_t type_length = sizeof(type);
+        assert(getsockopt(fd, SOL_SOCKET, SO_TYPE, (char *)&type, &type_length) == 0);
+        if (type == SOCK_DGRAM) {
+            int error = atomic_exchange_explicit(&udp_binding_failure, 0, memory_order_relaxed);
+            failed_udp_binding_socket = fd;
+            set_test_error(error);
+            return SOCKET_ERROR;
+        }
+    }
+    return setsockopt(fd, level, option, value, length);
+}
+#endif
 
 #ifdef _WIN32
 static int injected_ioctlsocket(SOCKET fd, long request, u_long *pending) {
@@ -917,6 +940,86 @@ static void *relay_fixture_thread(void *argument) {
     return NULL;
 #endif
 }
+
+#ifdef _WIN32
+static void assert_failed_udp_binding_closed(void) {
+    assert(atomic_load_explicit(&udp_binding_failure, memory_order_relaxed) == 0);
+    assert(failed_udp_binding_socket != INVALID_FD);
+    int type;
+    socklen_t length = sizeof(type);
+    assert(getsockopt(failed_udp_binding_socket, SOL_SOCKET, SO_TYPE,
+                       (char *)&type, &length) == SOCKET_ERROR);
+    assert(socket_error() == WSAENOTSOCK);
+    failed_udp_binding_socket = INVALID_FD;
+}
+
+static void test_udp_binding_failures(void) {
+    WSADATA winsock;
+    assert(WSAStartup(MAKEWORD(2, 2), &winsock) == 0);
+    wait_for_resolvers();
+    socket_t target = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    assert(target != INVALID_FD);
+    struct sockaddr_in local = {0};
+    local.sin_family = AF_INET;
+    local.sin_addr.s_addr = htonl(TEST_LOOPBACK_IP);
+    assert(bind(target, (struct sockaddr *)&local, sizeof(local)) == 0);
+    socklen_t length = sizeof(local);
+    assert(getsockname(target, (struct sockaddr *)&local, &length) == 0);
+    unsigned short port = ntohs(local.sin_port);
+    int previous_fake_dns = fake_dns;
+    fake_dns = 1;
+    const int failures[] = {WSAENOBUFS, WSAEACCES};
+    for (unsigned int i = 0; i < sizeof(failures) / sizeof(failures[0]); ++i) {
+        struct udp_destination destinations[UDP_DESTINATION_LIMIT] = {{0}};
+        struct udp_dns_entry cache[UDP_DNS_CACHE_LIMIT] = {{0}};
+        socket_t ipv4 = INVALID_FD, ipv6 = INVALID_FD;
+        unsigned int before = resolutions;
+        atomic_store_explicit(&udp_binding_failure, failures[i], memory_order_relaxed);
+        assert(!domain_request("binding.test", port, &ipv4, &ipv6, destinations, cache));
+        assert(ipv4 == INVALID_FD && ipv6 == INVALID_FD && resolutions == before + 1);
+        assert_failed_udp_binding_closed();
+        for (unsigned int slot = 0; slot < UDP_DESTINATION_LIMIT; ++slot)
+            assert(destinations[slot].expires_at_ms == 0);
+        for (unsigned int slot = 0; slot < UDP_DNS_CACHE_LIMIT; ++slot)
+            assert(cache[slot].expires_at_ms == 0);
+        assert(!wait_for_io(target, POLLIN, monotonic_milliseconds() + 10));
+        assert(domain_request("binding.test", port, &ipv4, &ipv6, destinations, cache));
+        assert(resolutions == before + 2);
+        assert(wait_for_io(target, POLLIN, monotonic_milliseconds() + 1000));
+        char received;
+        assert(recvfrom(target, &received, sizeof(received), 0, NULL, NULL) == 0);
+        close_socket(ipv4);
+
+        socket_t control[2];
+        control_pair(control);
+        assert(set_nonblocking(control[1], 1));
+        atomic_store_explicit(&udp_binding_failure, failures[i], memory_order_relaxed);
+        udp_associate(control[0], 0);
+        unsigned char reply[10];
+        assert(recv_all(control[1], reply, sizeof(reply), monotonic_milliseconds() + 1000));
+        assert(reply[0] == 5 && reply[1] == 1 && reply[2] == 0 && reply[3] == 1);
+        assert_failed_udp_binding_closed();
+        close_socket(control[0]);
+        close_socket(control[1]);
+
+        control_pair(control);
+        assert(set_nonblocking(control[1], 1));
+        HANDLE thread = CreateThread(NULL, 0, associate_fixture_thread, &control[0], 0, NULL);
+        assert(thread != NULL);
+        assert(recv_all(control[1], reply, sizeof(reply), monotonic_milliseconds() + 1000));
+        assert(reply[0] == 5 && reply[1] == 0 && reply[2] == 0 && reply[3] == 1);
+        assert(shutdown(control[1], SD_SEND) == 0);
+        assert(WaitForSingleObject(thread, 400) == WAIT_OBJECT_0);
+        CloseHandle(thread);
+        close_socket(control[1]);
+    }
+    wait_for_resolvers();
+    fake_dns = previous_fake_dns;
+    close_socket(target);
+    WSACleanup();
+    puts("Windows UDP binding checks passed (provider failures, closed sockets, no stale grants/cache, retry, association recovery).");
+}
+#endif
 
 static void test_expired_ready_events(void) {
 #ifdef _WIN32
@@ -1629,6 +1732,9 @@ int main(int argc, char **argv) {
         test_dns_cache();
         puts("UDP DNS checks passed (100 literals, zero resolutions; 100 case variants, one resolution; syntax, TTL, ports, failures).");
         test_udp_destination_lifetime();
+#ifdef _WIN32
+        test_udp_binding_failures();
+#endif
         test_udp_control_fairness();
         test_udp_control_backlog();
         test_expired_ready_events();
