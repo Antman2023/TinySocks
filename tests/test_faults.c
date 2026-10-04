@@ -195,6 +195,7 @@ static HANDLE failed_resolver_event;
 static WSAEVENT failed_control_event;
 #else
 static int failed_resolver_pipe[2];
+static int resolver_pipe_positive;
 #endif
 
 #ifdef _WIN32
@@ -214,7 +215,11 @@ static int injected_clock_gettime(clockid_t clock, struct timespec *now) {
 static void *injected_calloc(size_t count, size_t size) {
     if (resolver_setup_failure == 1) return NULL;
     void *result = calloc(count, size);
-    if (resolver_setup_action || resolver_entry_delay) resolver_setup_job = result;
+    int track_job = resolver_setup_action || resolver_entry_delay;
+#ifndef _WIN32
+    track_job = track_job || resolver_pipe_positive;
+#endif
+    if (track_job) resolver_setup_job = result;
     return result;
 }
 
@@ -370,10 +375,15 @@ static int injected_pipe(int *fds) {
         return -1;
     }
     int result = pipe(fds);
-    if (!result && (resolver_setup_failure == 3 || resolver_setup_action || resolver_entry_delay)) {
+    if (result >= 0 && (resolver_setup_failure == 3 || resolver_setup_action ||
+                       resolver_entry_delay || resolver_pipe_positive)) {
         failed_resolver_pipe[0] = fds[0];
         failed_resolver_pipe[1] = fds[1];
         if (resolver_setup_action) finish_resolver_setup();
+    }
+    if (result >= 0 && resolver_pipe_positive) {
+        assert(fds[0] > 0 && fds[1] > 0);
+        return fds[0];
     }
     return result;
 }
@@ -2031,6 +2041,42 @@ static void test_resolver_setup_cancellation(void) {
     puts("Resolver setup checks passed (expired budgets, UDP FIN, TCP reset, no worker starts, cleanup, TCP payload/FIN, recovery).");
 }
 
+#ifndef _WIN32
+static void test_resolver_positive_pipe(void) {
+    struct addrinfo hints = {0};
+    hints.ai_family = AF_INET;
+    hints.ai_flags = AI_NUMERICSERV;
+    for (int mode = RESOLVE_TCP; mode <= RESOLVE_UDP; ++mode) {
+        reset_held_dns();
+        hints.ai_socktype = mode == RESOLVE_TCP ? SOCK_STREAM : SOCK_DGRAM;
+        resolver_pipe_positive = 1;
+        struct addrinfo *addresses = NULL;
+        int error = resolve_target("localhost", "80", &hints, &addresses,
+                                    monotonic_milliseconds() + 1000, INVALID_FD,
+                                    (enum resolver_control_mode)mode);
+        printf("Resolver positive pipe: mode=%d result=%d descriptors=%d,%d\n",
+               mode, error, failed_resolver_pipe[0], failed_resolver_pipe[1]);
+        fflush(stdout);
+        assert(error == 0 && addresses != NULL);
+        freeaddrinfo(addresses);
+        wait_for_resolvers();
+        resolver_pipe_positive = 0;
+        assert(resolver_setup_job == NULL);
+        for (int i = 0; i < 2; ++i) {
+            assert(fcntl(failed_resolver_pipe[i], F_GETFD) == -1);
+            assert(errno == EBADF);
+        }
+        assert(resolve_target("localhost", "80", &hints, &addresses,
+                              monotonic_milliseconds() + 1000, INVALID_FD,
+                              (enum resolver_control_mode)mode) == 0);
+        freeaddrinfo(addresses);
+        wait_for_resolvers();
+    }
+    reset_held_dns();
+    puts("Resolver positive pipe checks passed (TCP/UDP DNS, valid descriptors, closed pipes/job, recovery).");
+}
+#endif
+
 static void test_resolver_delayed_entry(void) {
 #ifdef _WIN32
     WSADATA winsock;
@@ -2439,6 +2485,9 @@ int main(int argc, char **argv) {
         test_expired_ready_events();
         test_connection_fallback();
         test_resolver_setup_cancellation();
+#ifndef _WIN32
+        test_resolver_positive_pipe();
+#endif
         test_resolver_delayed_entry();
         test_resolver_abandoned_entry();
         test_resolver_deadline_and_limit();

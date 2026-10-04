@@ -503,7 +503,8 @@ static int resolve_target(const char *host, const char *port, const struct addri
     CloseHandle(thread);
 #else
     job->ready[0] = job->ready[1] = -1;
-    if (pipe(job->ready) != 0 ||
+    /* Some MIPS libc wrappers return a valid descriptor instead of zero. */
+    if (pipe(job->ready) < 0 ||
         fcntl(job->ready[0], F_SETFD, FD_CLOEXEC) != 0 ||
         fcntl(job->ready[1], F_SETFD, FD_CLOEXEC) != 0) goto failed;
     pthread_attr_t attributes;
