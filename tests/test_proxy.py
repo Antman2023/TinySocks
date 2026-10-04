@@ -826,6 +826,7 @@ class FaultProxyTests(ProxyTestCase):
                 time.sleep(0.01)
         if len(controls) != 2:
             self.fail("reset clients retained client slots during DNS waiting")
+        self.assertLess(time.monotonic(), deadline, "client slots recovered after the deadline")
         with controls[0] as control, controls[1], socket.socket() as target:
             target.bind(("127.0.0.1", 0))
             target.listen()
