@@ -323,6 +323,14 @@ static int resolver_control_open(socket_t control, enum resolver_control_mode mo
                                : tcp_socket_open(control);
 }
 
+/* Setup can outlast its budget or a control connection; recheck before launch. */
+static int resolver_can_start(socket_t control, enum resolver_control_mode mode,
+                               uint64_t deadline_ms) {
+    return remaining_milliseconds(deadline_ms) &&
+           resolver_control_open(control, mode, deadline_ms) &&
+           remaining_milliseconds(deadline_ms);
+}
+
 struct resolver_job {
     char host[256], port[6];
     struct addrinfo hints, *addresses;
@@ -463,7 +471,7 @@ static int resolve_target(const char *host, const char *port, const struct addri
         retry_pause(remaining_ms < 5 ? remaining_ms : 5);
     }
     /* A newly available slot is not permission to start work for a reset client. */
-    if (!resolver_control_open(control, mode, deadline_ms)) {
+    if (!resolver_can_start(control, mode, deadline_ms)) {
         atomic_fetch_sub_explicit(&active_resolvers, 1, memory_order_relaxed);
         return EAI_AGAIN;
     }
@@ -479,7 +487,7 @@ static int resolve_target(const char *host, const char *port, const struct addri
     job->hints = *hints;
 #ifdef _WIN32
     job->ready = CreateEvent(NULL, TRUE, FALSE, NULL);
-    if (!job->ready) goto failed;
+    if (!job->ready || !resolver_can_start(control, mode, deadline_ms)) goto failed;
     atomic_store_explicit(&job->references, 2, memory_order_relaxed);
     HANDLE thread = CreateThread(NULL, 0, resolver_thread, job, 0, NULL);
     if (!thread) {
@@ -496,6 +504,7 @@ static int resolve_target(const char *host, const char *port, const struct addri
     if (pthread_attr_init(&attributes) != 0) goto failed;
     int error = pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
     pthread_t thread;
+    if (!error && !resolver_can_start(control, mode, deadline_ms)) error = EAGAIN;
     if (!error) {
         atomic_store_explicit(&job->references, 2, memory_order_relaxed);
         error = pthread_create(&thread, &attributes, resolver_thread, job);
