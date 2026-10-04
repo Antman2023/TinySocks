@@ -728,6 +728,147 @@ static void reset_held_dns(void) {
         assert(atomic_load_explicit(&held_results[i], memory_order_relaxed) == NULL);
 }
 
+struct destination_fixture {
+    socket_t targets[UDP_DESTINATION_LIMIT + 1];
+    struct sockaddr_storage addresses[UDP_DESTINATION_LIMIT + 1];
+    socket_t outbound, association, receiver;
+    struct sockaddr_storage outbound_address, receiver_address;
+    struct udp_destination destinations[UDP_DESTINATION_LIMIT];
+    unsigned char packet[UDP_BUFFER_SIZE];
+};
+
+static void grant_udp_destination(struct destination_fixture *fixture, unsigned int index) {
+    socket_t ipv6 = INVALID_FD;
+    assert(send_udp_request((const unsigned char *)"ask", 3, &fixture->addresses[index],
+                            &fixture->outbound, &ipv6, fixture->destinations));
+    assert(ipv6 == INVALID_FD);
+    assert(wait_for_io(fixture->targets[index], POLLIN, monotonic_milliseconds() + 1000));
+    char received[8];
+    socklen_t length = sizeof(fixture->outbound_address);
+    assert(recvfrom(fixture->targets[index], received, sizeof(received), 0,
+                     (struct sockaddr *)&fixture->outbound_address, &length) == 3);
+    assert(!memcmp(received, "ask", 3));
+}
+
+static int receive_udp_destination_reply(struct destination_fixture *fixture,
+                                          unsigned int index) {
+    unsigned char payload[2] = {(unsigned char)index, 0xa5};
+    assert(sendto(fixture->targets[index], (const char *)payload, sizeof(payload), 0,
+                   (const struct sockaddr *)&fixture->outbound_address,
+                   address_length(&fixture->outbound_address)) == sizeof(payload));
+    assert(wait_for_io(fixture->outbound, POLLIN, monotonic_milliseconds() + 1000));
+    int forwarded = forward_udp_reply(fixture->outbound, fixture->association,
+                                       &fixture->receiver_address, fixture->packet,
+                                       fixture->destinations);
+    if (!forwarded) {
+        assert(!wait_for_io(fixture->receiver, POLLIN, monotonic_milliseconds() + 10));
+        return 0;
+    }
+    assert(wait_for_io(fixture->receiver, POLLIN, monotonic_milliseconds() + 1000));
+    unsigned char received[32];
+    assert(recvfrom(fixture->receiver, (char *)received, sizeof(received), 0, NULL, NULL) == 12);
+    const struct sockaddr_in *source = (const struct sockaddr_in *)&fixture->addresses[index];
+    const unsigned char header[] = {0, 0, 0, 1};
+    assert(!memcmp(received, header, sizeof(header)));
+    assert(!memcmp(received + 4, &source->sin_addr, 4));
+    assert(!memcmp(received + 8, &source->sin_port, 2));
+    assert(!memcmp(received + 10, payload, sizeof(payload)));
+    return 1;
+}
+
+static void test_udp_destination_lifetime(void) {
+#ifdef _WIN32
+    WSADATA winsock;
+    assert(WSAStartup(MAKEWORD(2, 2), &winsock) == 0);
+#endif
+    wait_for_resolvers(); /* Advance only this fixture's clock, with no DNS workers. */
+    struct destination_fixture *fixture = calloc(1, sizeof(*fixture));
+    assert(fixture != NULL);
+    fixture->outbound = INVALID_FD;
+    struct sockaddr_in local = {0};
+    local.sin_family = AF_INET;
+    local.sin_addr.s_addr = htonl(TEST_LOOPBACK_IP);
+    for (unsigned int i = 0; i <= UDP_DESTINATION_LIMIT; ++i) {
+        fixture->targets[i] = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        assert(fixture->targets[i] != INVALID_FD);
+        assert(bind(fixture->targets[i], (struct sockaddr *)&local, sizeof(local)) == 0);
+        socklen_t length = sizeof(fixture->addresses[i]);
+        assert(getsockname(fixture->targets[i], (struct sockaddr *)&fixture->addresses[i],
+                            &length) == 0);
+    }
+    fixture->association = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    fixture->receiver = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    assert(fixture->association != INVALID_FD && fixture->receiver != INVALID_FD);
+    assert(bind(fixture->association, (struct sockaddr *)&local, sizeof(local)) == 0);
+    assert(bind(fixture->receiver, (struct sockaddr *)&local, sizeof(local)) == 0);
+    socklen_t length = sizeof(fixture->receiver_address);
+    assert(getsockname(fixture->receiver, (struct sockaddr *)&fixture->receiver_address,
+                        &length) == 0);
+
+    grant_udp_destination(fixture, 0);
+    assert(receive_udp_destination_reply(fixture, 0));
+    assert(!receive_udp_destination_reply(fixture, 1)); /* Same IP, unvisited port. */
+    atomic_store_explicit(&clock_advance_seconds, UDP_DESTINATION_TTL_SECONDS / 2,
+                           memory_order_relaxed);
+    assert(receive_udp_destination_reply(fixture, 0));
+    atomic_store_explicit(&clock_advance_seconds, UDP_DESTINATION_TTL_SECONDS + 1,
+                           memory_order_relaxed);
+    /* A rejected send cannot renew access; receiving replies cannot renew it either. */
+    unsigned char *oversized = calloc(70000, 1);
+    assert(oversized != NULL);
+    socket_t ipv6 = INVALID_FD;
+    assert(!send_udp_request(oversized, 70000, &fixture->addresses[0],
+                             &fixture->outbound, &ipv6, fixture->destinations));
+    assert(!receive_udp_destination_reply(fixture, 0));
+    grant_udp_destination(fixture, 0);
+    assert(receive_udp_destination_reply(fixture, 0));
+    atomic_store_explicit(&clock_advance_seconds,
+                           UDP_DESTINATION_TTL_SECONDS + UDP_DESTINATION_TTL_SECONDS / 2,
+                           memory_order_relaxed);
+    grant_udp_destination(fixture, 0); /* A successful request renews a still-live grant. */
+    atomic_store_explicit(&clock_advance_seconds, 2 * UDP_DESTINATION_TTL_SECONDS + 1,
+                           memory_order_relaxed);
+    assert(receive_udp_destination_reply(fixture, 0));
+    assert(!send_udp_request(oversized, 70000, &fixture->addresses[0],
+                             &fixture->outbound, &ipv6, fixture->destinations));
+    free(oversized);
+    atomic_store_explicit(&clock_advance_seconds,
+                           2 * UDP_DESTINATION_TTL_SECONDS + UDP_DESTINATION_TTL_SECONDS / 2 + 1,
+                           memory_order_relaxed);
+    assert(!receive_udp_destination_reply(fixture, 0));
+
+    atomic_store_explicit(&clock_advance_seconds, 0, memory_order_relaxed);
+    memset(fixture->destinations, 0, sizeof(fixture->destinations));
+    grant_udp_destination(fixture, 0);
+    atomic_store_explicit(&clock_advance_seconds, 1, memory_order_relaxed);
+    for (unsigned int i = 1; i < UDP_DESTINATION_LIMIT; ++i) grant_udp_destination(fixture, i);
+    atomic_store_explicit(&clock_advance_seconds, 2, memory_order_relaxed);
+    grant_udp_destination(fixture, UDP_DESTINATION_LIMIT - 1);
+    /* Refresh a target other than the oldest; it must not evict or duplicate a grant. */
+    for (unsigned int i = 0; i < UDP_DESTINATION_LIMIT; ++i)
+        assert(receive_udp_destination_reply(fixture, i));
+    assert(!receive_udp_destination_reply(fixture, UDP_DESTINATION_LIMIT));
+    atomic_store_explicit(&clock_advance_seconds, 3, memory_order_relaxed);
+    grant_udp_destination(fixture, UDP_DESTINATION_LIMIT);
+    assert(receive_udp_destination_reply(fixture, UDP_DESTINATION_LIMIT - 1));
+    assert(receive_udp_destination_reply(fixture, UDP_DESTINATION_LIMIT));
+    unsigned int survivors = 2;
+    for (unsigned int i = 0; i < UDP_DESTINATION_LIMIT - 1; ++i)
+        survivors += receive_udp_destination_reply(fixture, i);
+    assert(survivors == UDP_DESTINATION_LIMIT);
+
+    for (unsigned int i = 0; i <= UDP_DESTINATION_LIMIT; ++i) close_socket(fixture->targets[i]);
+    close_socket(fixture->outbound);
+    close_socket(fixture->association);
+    close_socket(fixture->receiver);
+    free(fixture);
+    atomic_store_explicit(&clock_advance_seconds, 0, memory_order_relaxed);
+#ifdef _WIN32
+    WSACleanup();
+#endif
+    puts("UDP destination checks passed (real replies, ports, TTL, failed sends, refresh, capacity eviction).");
+}
+
 static void control_pair(socket_t pair[2]) {
     socket_t listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     assert(listener != INVALID_FD);
@@ -1487,6 +1628,7 @@ int main(int argc, char **argv) {
         setvbuf(stdout, NULL, _IOLBF, 0);
         test_dns_cache();
         puts("UDP DNS checks passed (100 literals, zero resolutions; 100 case variants, one resolution; syntax, TTL, ports, failures).");
+        test_udp_destination_lifetime();
         test_udp_control_fairness();
         test_udp_control_backlog();
         test_expired_ready_events();
