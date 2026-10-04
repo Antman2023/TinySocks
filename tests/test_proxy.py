@@ -810,22 +810,23 @@ class FaultProxyTests(ProxyTestCase):
 
     def assert_service_after_reset(self):
         deadline = time.monotonic() + 0.4
-        while time.monotonic() < deadline:
+        controls = []
+        while len(controls) < 2 and time.monotonic() < deadline:
             candidate = None
             try:
                 candidate = socket.create_connection(("127.0.0.1", self.port), 0.1)
+                self.addCleanup(candidate.close)
                 candidate.settimeout(0.1)
                 candidate.sendall(GREETING)
                 self.assertEqual(recv_exact(candidate, 2), b"\x05\x00")
-                control = candidate
-                break
+                controls.append(candidate)
             except (OSError, EOFError):
                 if candidate is not None:
                     candidate.close()
                 time.sleep(0.01)
-        else:
+        if len(controls) != 2:
             self.fail("reset clients retained client slots during DNS waiting")
-        with control, socket.socket() as target:
+        with controls[0] as control, controls[1], socket.socket() as target:
             target.bind(("127.0.0.1", 0))
             target.listen()
             target.settimeout(1)
