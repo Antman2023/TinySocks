@@ -135,6 +135,7 @@ static atomic_int udp_fixture_phase = ATOMIC_VAR_INIT(0);
 static atomic_uint clock_advance_seconds = ATOMIC_VAR_INIT(0);
 static _Atomic(socket_t) expired_poll_control = ATOMIC_VAR_INIT(INVALID_FD);
 static int expire_connect_ready, expire_connect_result;
+static socket_t expired_connect_socket = INVALID_FD;
 #ifdef _WIN32
 static HANDLE failed_resolver_event;
 static WSAEVENT failed_control_event;
@@ -347,6 +348,7 @@ static int injected_connect(int fd, const struct sockaddr *address, socklen_t le
         return -1;
     }
     int result = connect(fd, address, length);
+    if (expire_connect_ready || expire_connect_result) expired_connect_socket = fd;
     /* Even a provider completing immediately must exercise the chosen wait boundary. */
     if (!result && (expire_connect_ready || expire_connect_result)) {
 #ifdef _WIN32
@@ -1393,6 +1395,7 @@ static void test_connection_fallback(void) {
 
     for (int stage = 0; stage < 2; ++stage) {
         reset_connect_test(1);
+        expired_connect_socket = INVALID_FD;
         expire_connect_ready = stage == 0;
         expire_connect_result = stage == 1;
         target = connect_target("fallback.test", port, NULL, &status, INVALID_FD);
@@ -1401,11 +1404,17 @@ static void test_connection_fallback(void) {
         assert(target == INVALID_FD);
         assert(status == 4 && slow_closed == slow_count);
         assert(expire_connect_ready == 0 && expire_connect_result == 0);
-        accepted = accept(listener, NULL, NULL);
-        assert(accepted != INVALID_FD && set_nonblocking(accepted, 1));
-        assert(wait_for_io(accepted, POLLIN, monotonic_milliseconds() + 400));
-        assert(recv(accepted, (char *)payload, sizeof(payload), 0) == 0);
-        close_socket(accepted);
+        /* Verify the cancelled candidate directly without waiting in accept. */
+        int socket_type;
+        socklen_t socket_type_length = sizeof(socket_type);
+        assert(expired_connect_socket != INVALID_FD);
+        assert(getsockopt(expired_connect_socket, SOL_SOCKET, SO_TYPE,
+                          (char *)&socket_type, &socket_type_length) != 0);
+#ifdef _WIN32
+        assert(socket_error() == WSAENOTSOCK);
+#else
+        assert(socket_error() == EBADF);
+#endif
         assert(atomic_load_explicit(&clock_advance_seconds, memory_order_relaxed) ==
                CONNECT_TIMEOUT_SECONDS + 1);
         wait_for_resolvers();
@@ -1472,6 +1481,7 @@ static void test_connection_fallback(void) {
 
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--test-internals")) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
         test_dns_cache();
         puts("UDP DNS checks passed (100 literals, zero resolutions; 100 case variants, one resolution; syntax, TTL, ports, failures).");
         test_udp_control_fairness();

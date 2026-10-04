@@ -702,14 +702,14 @@ static socket_t connect_target(const char *host, const char *port,
         if (client != INVALID_FD && timeout_ms > TCP_PEER_CHECK_INTERVAL_MS)
             timeout_ms = TCP_PEER_CHECK_INTERVAL_MS;
         int ready = wait_for_connect(pending, count, timeout_ms);
-        if (!remaining_milliseconds(deadline_ms)) {
-            *status = 4;
-            break;
-        }
         if (ready < 0) {
             int error = socket_error();
             if (interrupted(error)) continue;
             *status = connect_error_status(error);
+            break;
+        }
+        if (!remaining_milliseconds(deadline_ms)) {
+            *status = 4;
             break;
         }
         if (ready > 0 && !tcp_socket_open(client)) {
