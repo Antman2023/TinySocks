@@ -179,6 +179,8 @@ static int control_query_failure;
 static socket_t udp_fixture_control = INVALID_FD;
 static atomic_int udp_fixture_phase = ATOMIC_VAR_INIT(0);
 static atomic_uint clock_advance_seconds = ATOMIC_VAR_INIT(0);
+/* The observer of an expired worker still has a real-time response budget. */
+static _Thread_local int observe_real_clock;
 static _Atomic(socket_t) expired_poll_control = ATOMIC_VAR_INIT(INVALID_FD);
 static int expire_connect_ready, expire_connect_result;
 static socket_t expired_connect_socket = INVALID_FD;
@@ -200,13 +202,13 @@ static int resolver_pipe_positive;
 
 #ifdef _WIN32
 static ULONGLONG injected_tick_count(void) {
-    return GetTickCount64() + (ULONGLONG)atomic_load_explicit(
-        &clock_advance_seconds, memory_order_relaxed) * 1000;
+    return GetTickCount64() + (observe_real_clock ? 0 : (ULONGLONG)atomic_load_explicit(
+        &clock_advance_seconds, memory_order_relaxed)) * 1000;
 }
 #else
 static int injected_clock_gettime(clockid_t clock, struct timespec *now) {
     int result = clock_gettime(clock, now);
-    if (!result && clock == CLOCK_MONOTONIC)
+    if (!result && clock == CLOCK_MONOTONIC && !observe_real_clock)
         now->tv_sec += atomic_load_explicit(&clock_advance_seconds, memory_order_relaxed);
     return result;
 }
@@ -1477,6 +1479,7 @@ static void test_udp_binding_failures(void) {
 #endif
 
 static void test_expired_ready_events(void) {
+    observe_real_clock = 1;
 #ifdef _WIN32
     WSADATA winsock;
     assert(WSAStartup(MAKEWORD(2, 2), &winsock) == 0);
@@ -1496,8 +1499,16 @@ static void test_expired_ready_events(void) {
 #endif
         socket_t source = upstream ? client[1] : target[1];
         socket_t receiver = upstream ? target[1] : client[1];
+        uint64_t observation_deadline_ms = monotonic_milliseconds() + 400;
         assert(send(source, "late", 4, 0) == 4);
-        assert(wait_for_io(receiver, POLLIN, monotonic_milliseconds() + 400));
+        /* Force the worker's clock jump to happen after this observer's budget
+           starts. It must still close promptly without forwarding late data. */
+        while (atomic_load_explicit(&clock_advance_seconds, memory_order_relaxed) !=
+               IDLE_TIMEOUT_SECONDS + 1) {
+            assert(remaining_milliseconds(observation_deadline_ms));
+            retry_pause(1);
+        }
+        assert(wait_for_io(receiver, POLLIN, observation_deadline_ms));
         char received[8];
         assert(recv(receiver, received, sizeof(received), 0) == 0);
 #ifdef _WIN32
@@ -1572,7 +1583,8 @@ static void test_expired_ready_events(void) {
 #ifdef _WIN32
     WSACleanup();
 #endif
-    puts("Expired readiness checks passed (TCP both directions, UDP replies, no idle revival).");
+    observe_real_clock = 0;
+    puts("Expired readiness checks passed (TCP both directions, UDP replies, no idle revival, real-time observer).");
 }
 
 static void test_udp_control_backlog(void) {
@@ -1691,7 +1703,7 @@ static void test_udp_control_fairness(void) {
     ready.ready = CreateEventA(NULL, TRUE, TRUE, NULL);
     assert(ready.ready != NULL);
 #else
-    assert(pipe(ready.ready) == 0);
+    assert(pipe(ready.ready) >= 0);
     assert(write(ready.ready[1], "r", 1) == 1);
 #endif
     continuous_control = control[0];
