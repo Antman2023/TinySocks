@@ -232,6 +232,12 @@ static int injected_close(SOCKET fd) {
 #else
 static int injected_close(int fd) {
 #endif
+#ifndef _WIN32
+    /* Resolver workers close pipes without touching the main test's socket state. */
+    int type;
+    socklen_t length = sizeof(type);
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &length) != 0) return close(fd);
+#endif
     if (fake_connect && slow_socket(fd)) {
         ++slow_closed;
         for (unsigned int i = 0; i < slow_count; ++i)
@@ -279,19 +285,23 @@ static int injected_select(int ignored, fd_set *readable, fd_set *writable,
 static int injected_poll(struct pollfd *fds, nfds_t count, int timeout) {
     if (!fake_connect) return poll(fds, count, timeout);
     ++connect_waits;
-    if (fake_connect == 3) {
-        for (nfds_t i = 0; i < count; ++i) fds[i].revents = POLLOUT;
-        return (int)count;
-    }
     struct pollfd visible[CONNECT_PENDING_LIMIT];
     assert(count <= CONNECT_PENDING_LIMIT);
+    int forced = 0;
     for (nfds_t i = 0; i < count; ++i) {
         visible[i] = fds[i];
-        if (slow_socket(visible[i].fd)) visible[i].fd = -1;
+        if (slow_socket(visible[i].fd)) {
+            visible[i].fd = -1;
+            if (fake_connect == 3) ++forced;
+        }
     }
-    int ready = poll(visible, count, timeout);
-    for (nfds_t i = 0; i < count; ++i) fds[i].revents = visible[i].revents;
-    return ready;
+    /* Real read descriptors, including resolver pipes, keep their actual readiness. */
+    int ready = poll(visible, count, forced ? 0 : timeout);
+    if (ready < 0) return ready;
+    for (nfds_t i = 0; i < count; ++i)
+        fds[i].revents = fake_connect == 3 && slow_socket(fds[i].fd) ?
+                          POLLOUT : visible[i].revents;
+    return ready + forced;
 }
 #endif
 

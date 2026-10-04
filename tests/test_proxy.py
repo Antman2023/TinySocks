@@ -692,7 +692,8 @@ class FaultProxyTests(ProxyTestCase):
             self.assertEqual(header[:3], b"\x05\x04\x00")
             self.assertLess(time.monotonic() - start, 1.5)
             self.assert_closed(control)
-            listener.settimeout(0.1)
+            # Keep the listener open beyond the delayed resolver's completion.
+            listener.settimeout(1.2)
             with self.assertRaises(socket.timeout):
                 listener.accept()
 
