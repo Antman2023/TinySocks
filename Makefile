@@ -64,6 +64,7 @@ test: $(TEST_OUTPUT) $(FAULT_TEST_OUTPUT)
 		FaultClientSetupTests FaultTCPIOTests \
 		ProxyTests.test_domain_connect_and_pipelined_payload \
 		ProxyTests.test_udp_domain_and_empty_payload IPv6ProxyTests \
+		ProxyTests.test_udp_numeric_payload_sizes \
 		WildcardListenerTests WildcardIPv6ListenerTests \
 		WindowsUDPBindingTests WindowsUDPIPv6BindingTests -v
 

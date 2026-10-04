@@ -757,24 +757,37 @@ class ProxyTests(ProxyTestCase):
             self.assertEqual(client.recvfrom(100)[0],
                              b"\x00\x00\x00" + encode_address(*target.getsockname()))
 
-    def test_udp_numeric_payload_sizes(self):
+    def large_udp_round_trip(self, family, host):
         with self.control() as control, \
-             socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client, \
-             socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as target:
+             socket.socket(socket.AF_INET6 if ":" in self.listen_host else socket.AF_INET,
+                           socket.SOCK_DGRAM) as client, \
+             socket.socket(family, socket.SOCK_DGRAM) as target:
             relay = self.associate(control)
-            target.bind(("127.0.0.1", 0))
+            try:
+                target.bind((host, 0))
+            except OSError:
+                if family == socket.AF_INET6:
+                    self.skipTest("IPv6 loopback is unavailable")
+                raise
+            for sock in (client, target):
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 131072)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 131072)
             target.settimeout(2)
             client.settimeout(2)
-            header = b"\x00\x00\x00" + encode_address(*target.getsockname())
-            # Stay within platforms' default UDP send-buffer limits.
-            large_payload = random.Random(1).getrandbits(8192 * 8).to_bytes(8192, "little")
-            for payload in [b"", large_payload]:
-                with self.subTest(size=len(payload)):
+            header = b"\x00\x00\x00" + encode_address(host, target.getsockname()[1])
+            # 65,485 bytes plus the largest SOCKS header fits IPv4's UDP limit.
+            for size in (0, 8192, 16384, 49152, 65485):
+                payload = random.Random(size).getrandbits(size * 8).to_bytes(size, "little")
+                with self.subTest(size=size, target_family=family):
                     client.sendto(header + payload, relay)
                     data, outbound = target.recvfrom(65536)
                     self.assertEqual(data, payload)
                     target.sendto(data, outbound)
                     self.assertEqual(client.recvfrom(65536)[0], header + payload)
+
+    def test_udp_numeric_payload_sizes(self):
+        for family, host in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+            self.large_udp_round_trip(family, host)
 
     def test_udp_domain_case_variants_and_destination_ports(self):
         with ExitStack() as stack:
@@ -1293,6 +1306,10 @@ class FaultProxyTests(ProxyTestCase):
 
 class IPv6ProxyTests(ProxyTestCase):
     listen_host = "::1"
+
+    def test_ipv6_listener_large_udp(self):
+        for family, host in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+            ProxyTests.large_udp_round_trip(self, family, host)
 
     def test_ipv6_listener_tcp(self):
         with socket.socket() as listener, self.control() as control:

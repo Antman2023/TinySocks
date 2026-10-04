@@ -34,6 +34,9 @@ jobs:
       - name: Test SOCKS5 behavior
         shell: bash
         run: |
+          if [ "$RUNNER_OS" = macOS ]; then
+            python3 -c 'import socket; s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); print("UDP buffers:", s.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF), s.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)); s.close()'
+          fi
           make test PYTHON=${{ matrix.python }}
 
   test-memory:
@@ -51,6 +54,7 @@ jobs:
             FaultClientSetupTests FaultTCPIOTests \
             ProxyTests.test_domain_connect_and_pipelined_payload \
             ProxyTests.test_udp_domain_and_empty_payload \
+            ProxyTests.test_udp_numeric_payload_sizes \
             ProxyTests.test_tcp_client_reset_under_backpressure_releases_slot \
             ProxyTests.test_tcp_target_reset_under_backpressure_releases_slot \
             ProxyTests.test_tcp_half_close_under_backpressure \
