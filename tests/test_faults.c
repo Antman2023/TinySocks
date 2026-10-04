@@ -31,6 +31,7 @@ static int injected_close(SOCKET);
 static int injected_getsockopt(SOCKET, int, int, char *, int *);
 static int injected_recv(SOCKET, char *, int, int);
 static int injected_ioctlsocket(SOCKET, long, u_long *);
+static int injected_wsa_poll(WSAPOLLFD *, ULONG, INT);
 static int injected_select(int, fd_set *, fd_set *, fd_set *, const struct timeval *);
 static HANDLE injected_create_event(LPSECURITY_ATTRIBUTES, BOOL, BOOL, LPCSTR);
 static HANDLE injected_create_thread(LPSECURITY_ATTRIBUTES, SIZE_T, LPTHREAD_START_ROUTINE,
@@ -59,6 +60,7 @@ static int injected_pthread_create(pthread_t *, const pthread_attr_t *,
 #define recv injected_recv
 #ifdef _WIN32
 #define ioctlsocket injected_ioctlsocket
+#define WSAPoll injected_wsa_poll
 #undef CreateEvent
 #define CreateEvent injected_create_event
 #define CreateThread injected_create_thread
@@ -85,6 +87,7 @@ static int injected_pthread_create(pthread_t *, const pthread_attr_t *,
 #undef recv
 #ifdef _WIN32
 #undef ioctlsocket
+#undef WSAPoll
 #undef CreateEvent
 #undef CreateThread
 #undef closesocket
@@ -120,6 +123,8 @@ static int resolver_setup_failure;
 static socket_t continuous_control = INVALID_FD;
 static unsigned int continuous_reads;
 static int control_query_failure;
+static socket_t udp_fixture_control = INVALID_FD;
+static atomic_int udp_fixture_phase = ATOMIC_VAR_INIT(0);
 #ifdef _WIN32
 static HANDLE failed_resolver_event;
 static WSAEVENT failed_control_event;
@@ -356,7 +361,25 @@ static int injected_getsockopt(int fd, int level, int option, void *value, sockl
     return getsockopt(fd, level, option, value, length);
 }
 
+/* Hold the association's first poll until real TCP and UDP input are both queued. */
+static void synchronize_udp_input(pollfd_t *fds, size_t count) {
+    if (count < 2 || fds[0].fd != udp_fixture_control ||
+        atomic_load_explicit(&udp_fixture_phase, memory_order_acquire) == 2) return;
+    uint64_t deadline_ms = monotonic_milliseconds() + 2000;
+    while (!atomic_load_explicit(&udp_fixture_phase, memory_order_acquire)) {
+        assert(remaining_milliseconds(deadline_ms));
+        retry_pause(1);
+    }
+    assert(wait_for_io(fds[1].fd, POLLIN, deadline_ms));
+    atomic_store_explicit(&udp_fixture_phase, 2, memory_order_release);
+}
+
 #ifdef _WIN32
+static int injected_wsa_poll(WSAPOLLFD *fds, ULONG count, INT timeout) {
+    synchronize_udp_input(fds, count);
+    return WSAPoll(fds, count, timeout);
+}
+
 static int injected_select(int ignored, fd_set *readable, fd_set *writable,
                             fd_set *failed, const struct timeval *timeout) {
     if (!fake_connect) return select(ignored, readable, writable, failed, timeout);
@@ -376,6 +399,7 @@ static int injected_select(int ignored, fd_set *readable, fd_set *writable,
 }
 #else
 static int injected_poll(struct pollfd *fds, nfds_t count, int timeout) {
+    synchronize_udp_input(fds, count);
     if (!fake_connect) return poll(fds, count, timeout);
     ++connect_waits;
     struct pollfd visible[CONNECT_PENDING_LIMIT];
@@ -643,6 +667,125 @@ static void control_pair(socket_t pair[2]) {
     pair[0] = accept(listener, NULL, NULL);
     assert(pair[0] != INVALID_FD && set_nonblocking(pair[0], 1));
     close_socket(listener);
+}
+
+#ifdef _WIN32
+static DWORD WINAPI associate_fixture_thread(LPVOID argument) {
+#else
+static void *associate_fixture_thread(void *argument) {
+#endif
+    socket_t client = *(socket_t *)argument;
+    udp_associate(client, 0);
+    close_socket(client);
+#ifdef _WIN32
+    return 0;
+#else
+    return NULL;
+#endif
+}
+
+static void test_udp_control_backlog(void) {
+#ifdef _WIN32
+    WSADATA winsock;
+    assert(WSAStartup(MAKEWORD(2, 2), &winsock) == 0);
+#endif
+    for (int closed = 0; closed <= 1; ++closed) {
+        socket_t control[2];
+        control_pair(control);
+        int receive_size = 512 * 1024;
+        assert(setsockopt(control[0], SOL_SOCKET, SO_RCVBUF,
+                         (const char *)&receive_size, sizeof(receive_size)) == 0);
+        assert(set_nonblocking(control[1], 1));
+        const size_t backlog_size = 200 * 1024;
+        unsigned char *backlog = malloc(backlog_size);
+        assert(backlog != NULL);
+        memset(backlog, 'b', backlog_size);
+        uint64_t deadline_ms = monotonic_milliseconds() + 2000;
+        assert(send_all(control[1], backlog, backlog_size, deadline_ms));
+        free(backlog);
+        if (closed) {
+#ifdef _WIN32
+            assert(shutdown(control[1], SD_SEND) == 0);
+#else
+            assert(shutdown(control[1], SHUT_WR) == 0);
+#endif
+        }
+        /* The entire backlog must be in the receiver, not the sender's queue. */
+        for (;;) {
+#ifdef _WIN32
+            u_long queued;
+            assert(ioctlsocket(control[0], FIONREAD, &queued) == 0);
+#else
+            int queued;
+            assert(ioctl(control[0], FIONREAD, &queued) == 0);
+#endif
+            if ((size_t)queued == backlog_size) break;
+            assert(remaining_milliseconds(deadline_ms));
+            retry_pause(1);
+        }
+        socket_t target = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        socket_t sender = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        assert(target != INVALID_FD && sender != INVALID_FD);
+        struct sockaddr_in local = {0};
+        local.sin_family = AF_INET;
+        local.sin_addr.s_addr = htonl(TEST_LOOPBACK_IP);
+        assert(bind(target, (struct sockaddr *)&local, sizeof(local)) == 0);
+        socklen_t length = sizeof(local);
+        assert(getsockname(target, (struct sockaddr *)&local, &length) == 0);
+        unsigned short port = ntohs(local.sin_port);
+        udp_fixture_control = control[0];
+        atomic_store_explicit(&udp_fixture_phase, 0, memory_order_relaxed);
+#ifdef _WIN32
+        HANDLE thread = CreateThread(NULL, 0, associate_fixture_thread, &control[0], 0, NULL);
+        assert(thread != NULL);
+#else
+        pthread_t thread;
+        assert(pthread_create(&thread, NULL, associate_fixture_thread, &control[0]) == 0);
+#endif
+        unsigned char reply[10];
+        assert(recv_all(control[1], reply, sizeof(reply), deadline_ms));
+        assert(reply[0] == 5 && reply[1] == 0 && reply[3] == 1);
+        struct sockaddr_in relay_address = {0};
+        relay_address.sin_family = AF_INET;
+        memcpy(&relay_address.sin_addr, reply + 4, 4);
+        memcpy(&relay_address.sin_port, reply + 8, 2);
+        const unsigned char packet[] = {0, 0, 0, 1, 127, 0, 0, 1,
+                                        (unsigned char)(port >> 8), (unsigned char)port,
+                                        'u', 'd', 'p'};
+        assert(sendto(sender, (const char *)packet, sizeof(packet), 0,
+                       (struct sockaddr *)&relay_address, sizeof(relay_address)) == sizeof(packet));
+        atomic_store_explicit(&udp_fixture_phase, 1, memory_order_release);
+        if (!closed) {
+            assert(wait_for_io(target, POLLIN, deadline_ms));
+            unsigned char received[4];
+            assert(recvfrom(target, (char *)received, sizeof(received), 0, NULL, NULL) == 3);
+            assert(memcmp(received, packet + 10, 3) == 0);
+#ifdef _WIN32
+            assert(shutdown(control[1], SD_SEND) == 0);
+#else
+            assert(shutdown(control[1], SHUT_WR) == 0);
+#endif
+        }
+        assert(wait_for_io(control[1], POLLIN, monotonic_milliseconds() + 400));
+        char eof;
+        assert(recv(control[1], &eof, 1, 0) == 0);
+#ifdef _WIN32
+        assert(WaitForSingleObject(thread, 400) == WAIT_OBJECT_0);
+        CloseHandle(thread);
+#else
+        assert(pthread_join(thread, NULL) == 0);
+#endif
+        if (closed)
+            assert(!wait_for_io(target, POLLIN, monotonic_milliseconds() + 100));
+        udp_fixture_control = INVALID_FD;
+        close_socket(control[1]);
+        close_socket(target);
+        close_socket(sender);
+    }
+#ifdef _WIN32
+    WSACleanup();
+#endif
+    puts("UDP backlog checks passed (200 KiB queued, intact live request, EOF before numeric forwarding).");
 }
 
 static void test_udp_control_fairness(void) {
@@ -1124,6 +1267,7 @@ int main(int argc, char **argv) {
         test_dns_cache();
         puts("UDP DNS checks passed (100 literals, zero resolutions; 100 case variants, one resolution; syntax, TTL, ports, failures).");
         test_udp_control_fairness();
+        test_udp_control_backlog();
         test_connection_fallback();
         test_resolver_deadline_and_limit();
         test_resolver_control_close();

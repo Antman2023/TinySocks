@@ -1191,9 +1191,7 @@ static void udp_associate(socket_t client, unsigned short requested_port) {
         if (ready == 0) break;
         if (readable[0].revents) {
             /* The TCP control connection defines the association lifetime. */
-            int count = recv(client, (char *)packet, sizeof(packet), 0);
-            if (count == 0 || (count < 0 && !interrupted(socket_error()) &&
-                              !would_block(socket_error()))) break;
+            if (!udp_control_open(client, deadline_ms)) break;
         }
         if (readable[1].revents) {
             struct sockaddr_storage source;
