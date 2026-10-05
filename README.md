@@ -1,182 +1,218 @@
 # TinySocks
 
-一个单文件 C 实现的 SOCKS5 代理，使用 `zig cc` 编译。支持无认证的 TCP `CONNECT` 和 `UDP ASSOCIATE` 命令，以及 IPv4、IPv6 和域名目标。
+**单文件 C 实现的 SOCKS5 代理，使用 Zig 交叉编译，支持 TCP 与 UDP 转发。**
 
-## 自动编译与发布
+适合需要独立代理程序的 Linux、Windows、macOS 环境，也提供 ARM 和 MIPS 的静态 Linux 构建。
 
-推送到 `master`、提交 Pull Request 或手动运行 GitHub Actions 时，会先在 Linux、Windows 和 macOS 上运行协议回归测试，通过后自动编译以下版本。编译结果可在对应的 Actions 运行页面下载。
+[下载最新版](https://github.com/Antman2023/TinySocks/releases/latest) · [构建与测试](https://github.com/Antman2023/TinySocks/actions) · [技术说明](docs/technical-notes.md) · [反馈问题](https://github.com/Antman2023/TinySocks/issues)
 
-| 系统 | 架构 | 发布文件 |
+> **安全提示：TinySocks 不提供身份认证，也不加密代理传输。默认监听 `0.0.0.0:1080`，即所有 IPv4 接口。仅本机使用时请显式绑定 `127.0.0.1`；对其他设备开放时，务必使用防火墙或受信任网络限制访问。**
+
+## 功能与边界
+
+- 支持 SOCKS5 `CONNECT`（TCP）和 `UDP ASSOCIATE`，不支持 `BIND`。
+- 支持 IPv4、IPv6 和域名目标；域名由代理所在系统解析。
+- TCP 支持双向非阻塞转发、背压和半关闭；单方向转发缓冲区为 16 KiB。
+- UDP 支持来源校验、目标回复许可和会话内域名缓存；不支持 SOCKS5 UDP 分片（`FRAG` 必须为 `0`）。
+- 使用会话数量、解析任务数量及超时限制控制资源占用。
+- 无配置文件、用户名密码、HTTP 代理接口或内置访问控制列表；运行参数仅为监听地址和端口。
+
+## 快速开始
+
+### 1. 下载对应程序
+
+从 [Releases](https://github.com/Antman2023/TinySocks/releases/latest) 下载与你的操作系统、CPU 架构匹配的附件。运行预编译程序不需要安装 Zig 或 Make。
+
+| 系统 | 架构 | 文件名 |
 | --- | --- | --- |
-| Linux | x86_64、arm64、armv7 | `tinysocks-linux-*` |
-| Linux | MIPS 小端、大端 | `tinysocks-linux-mipsel`、`tinysocks-linux-mips` |
-| Windows | x86_64、arm64 | `tinysocks-windows-*.exe` |
-| macOS | x86_64、arm64 | `tinysocks-macos-*` |
+| Linux | x86_64 | `tinysocks-linux-x86_64` |
+| Linux | ARM64 | `tinysocks-linux-arm64` |
+| Linux | ARMv7 | `tinysocks-linux-armv7` |
+| Linux | MIPS 小端 | `tinysocks-linux-mipsel` |
+| Linux | MIPS 大端 | `tinysocks-linux-mips` |
+| Windows | x86_64 | `tinysocks-windows-x86_64.exe` |
+| Windows | ARM64 | `tinysocks-windows-arm64.exe` |
+| macOS | Intel | `tinysocks-macos-x86_64` |
+| macOS | Apple Silicon | `tinysocks-macos-arm64` |
 
-Linux 版本为静态编译。推送以 `v` 开头的版本标签（例如 `v1.0.0`）后，Actions 会创建 GitHub Release，附上全部程序及 `SHA256SUMS` 校验文件：
+Linux 发布程序为静态链接。MIPS 附件使用 MIPS32 soft-float ABI，ARMv7 使用 hard-float ABI；请核对设备的架构、大小端及 ABI，静态链接不代表兼容所有内核或 CPU。
 
-```sh
-git tag v1.0.0
-git push origin v1.0.0
-```
-
-Linux 和 macOS 程序下载后需要添加执行权限，例如 `chmod +x tinysocks-linux-x86_64`。
-
-发布程序保留 `-O2` 优化，移除调试信息并清理未使用代码；Linux 还使用链接时优化（LTO）。Windows 和 macOS 使用各自支持的链接参数。发布附件只包含九个程序及校验文件，不包含 PDB 调试文件。CI 会下载实际构建附件，在三个系统上校验 SHA256 并执行协议测试，通过后才创建 Release。
-
-静态 Linux 附件通过 ELF 栈声明将 musl 的默认客户端及解析线程栈设为 1 MiB，避免 Zig 的默认声明使每个线程预留 8 MiB 地址空间。64 个客户端的栈预留由约 512 MiB 降至 64 MiB；这是虚拟地址空间预留，不等同于实际驻留内存。MIPS 发布代码中的 UDP 主函数栈帧约为 76 KiB，TCP 转发约为 32 KiB，分别位于独立函数中；1 MiB 为调用链及系统解析器保留余量。声明由 [musl 初始化代码](https://github.com/ziglang/zig/blob/master/lib/libc/musl/src/env/__init_tls.c)读取；自定义 Linux 编译命令也应保留相应链接参数。
-
-CI 为 Zig 库目录创建固定路径，避免编译器每次解压到不同临时目录后重复构建 C 运行库。Linux 和 macOS 使用符号链接，Windows 使用临时盘上的目录联接；编译器版本、编译选项及源码仍参与正常的缓存检查。
-
-## 编译
-
-安装 Zig 和 GNU Make 后，在仓库目录运行：
+每个 Release 还提供 `SHA256SUMS`。下载后可计算程序的 SHA-256，并与该文件中对应文件名的值比较：
 
 ```sh
-make        # 默认：这台设备使用的小端 MIPS 静态版本
-make mips   # 大端 MIPS 静态版本
-make host   # 当前电脑的版本
-make release # 全部九个平台/架构，输出到 dist/
+# Linux
+sha256sum tinysocks-linux-x86_64
+
+# macOS
+shasum -a 256 tinysocks-macos-arm64
 ```
-
-修改源码或 Makefile 后再次运行 `make` 会自动重新编译。也可以不用 Make，直接运行以下 `zig cc` 命令。
-
-Windows（PowerShell）：
 
 ```powershell
-zig cc -std=c11 -O2 -Wall -Wextra -ffunction-sections -fdata-sections '-Wl,--gc-sections' -s tinysocks.c -o tinysocks.exe -lws2_32
+# Windows PowerShell
+Get-FileHash .\tinysocks-windows-x86_64.exe -Algorithm SHA256
 ```
 
-Linux：
+### 2. 启动代理
+
+Linux（x86_64 示例）：
 
 ```sh
-zig cc -std=c11 -O2 -flto -Wall -Wextra -ffunction-sections -fdata-sections '-Wl,--gc-sections' '-Wl,-z,stack-size=1048576' -s tinysocks.c -o tinysocks -pthread
+chmod +x tinysocks-linux-x86_64
+./tinysocks-linux-x86_64 127.0.0.1 1080
 ```
 
-macOS：
+macOS（Apple Silicon 示例）：
 
 ```sh
-zig cc -std=c11 -O2 -Wall -Wextra '-Wl,-dead_strip' -s tinysocks.c -o tinysocks -pthread
+chmod +x tinysocks-macos-arm64
+./tinysocks-macos-arm64 127.0.0.1 1080
 ```
 
-Linux MIPS 交叉编译（静态链接，按体积优化，适用于相应的 MIPS32 soft-float ABI）：
+Windows（PowerShell，x86_64 示例）：
+
+```powershell
+.\tinysocks-windows-x86_64.exe 127.0.0.1 1080
+```
+
+看到 `SOCKS5 listening on 127.0.0.1:1080` 后即可连接。程序在前台运行，按 `Ctrl+C` 退出。
+
+### 3. 配置或测试客户端
+
+将客户端的代理类型设为 **SOCKS5**，地址设为 `127.0.0.1`，端口设为 `1080`，无需用户名和密码。
+
+在另一个终端使用 curl 测试 TCP 转发：
 
 ```sh
-# 小端 MIPS (mipsel)
-zig cc -target mipsel-linux-musleabi -std=c11 -Oz -flto -ffunction-sections -fdata-sections -fno-unwind-tables -fno-asynchronous-unwind-tables '-Wl,--gc-sections' '-Wl,-z,stack-size=1048576' -s tinysocks.c -o tinysocks-mipsel -pthread -static
-
-# 大端 MIPS (mips)
-zig cc -target mips-linux-musleabi -std=c11 -Oz -flto -ffunction-sections -fdata-sections -fno-unwind-tables -fno-asynchronous-unwind-tables '-Wl,--gc-sections' '-Wl,-z,stack-size=1048576' -s tinysocks.c -o tinysocks-mips -pthread -static
+curl --socks5-hostname 127.0.0.1:1080 https://example.com/
 ```
 
-目标设备如果使用 hard-float ABI，可把目标名中的 `musleabi` 改为 `musleabihf`。请按设备的大小端和 ABI 选择对应产物。
+`--socks5-hostname` 将目标域名交给代理解析。Windows PowerShell 中可使用 `curl.exe`，避免旧版 PowerShell 的 `curl` 别名。此命令需要外网访问，且只验证 TCP；UDP 需要支持 SOCKS5 UDP 的客户端。
 
-早期版本曾在 Ingenic Xburst 小端 MIPS、Linux 3.0.8 的设备上验证 SOCKS5 转发，当时使用 Zig 0.16.0 编译的 `tinysocks-mipsel` 为 88,460 字节；当前版本体积以实际编译结果为准。该设备使用 glibc 2.6.1，静态链接避免了旧版动态库的兼容问题。
-
-## 运行
+## 运行参数
 
 ```text
 tinysocks [监听地址 [端口]]
 ```
 
-默认监听 `0.0.0.0:1080`。例如，仅允许本机连接时运行 `tinysocks 127.0.0.1 1080`。
-
-Windows 的 TCP 监听、UDP 关联端口及 UDP 出站套接字均在绑定前启用 `SO_EXCLUSIVEADDRUSE`，保护接收端点，避免其他本地套接字接走连接或目标回复；出站 UDP 在首次发送触发隐式绑定前完成该配置。配置失败时立即关闭新套接字；UDP 关联建立失败返回状态 `1`，出站配置失败则丢弃本次请求，不写入目标许可或 DNS 缓存，也不锁定客户端端口，后续请求可重新建立套接字。Windows 的通配地址监听也会拒绝在已被其他监听程序占用的端口上启动。Linux 和 macOS 的 TCP 监听使用 `SO_REUSEADDR` 支持正常重启。绑定规则详见 [Windows 套接字文档](https://learn.microsoft.com/en-us/windows/win32/winsock/using-so-reuseaddr-and-so-exclusiveaddruse)。
-
-macOS 的 UDP 关联及出站套接字将不足 64 KiB 的发送容量提高到 64 KiB，保留系统已有的更大容量，使较大数据报可以完整转发。Darwin 的默认 UDP 发送容量为 9,216 字节，也限制单个数据报大小；详见 [Apple UDP 实现](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/netinet/udp_usrreq.c)与[套接字发送实现](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/uipc_socket.c)。查询或设置容量失败时立即关闭新套接字，关联建立返回状态 `1`；出站失败不写入目标许可或 DNS 缓存，后续请求可重试。报文连同 SOCKS5 头仍须符合所用 IP 版本的 UDP 长度限制。
-
-macOS 的通配地址与具体地址允许同账户下通过 `SO_REUSEADDR` 重叠绑定，不能据此提供 Windows 的独占保证；需要避免这类端点重叠时，请指定具体监听地址。该行为由 [XNU 的绑定检查](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/netinet/in_pcb.c)决定。
-
-端口必须为 `0` 到 `65535` 的十进制数字；端口 `0` 由系统分配可用端口，例如 `tinysocks 127.0.0.1 0`。启动日志显示实际绑定的数字地址和端口，IPv6 地址使用方括号，如 `[::1]:1080`。使用 `tinysocks --help` 或 `tinysocks -h` 查看用法。
-
-可用 `curl --socks5-hostname 127.0.0.1:1080 http://example.com/` 测试 TCP 转发。TCP 使用非阻塞双向转发，每个方向最多缓存 16 KiB；环形缓冲区避免部分发送后反复搬移数据，接收端变慢时仍可处理反向流量。支持 TCP 半关闭，已接收的数据发送完毕后才向另一端传递 EOF。
-
-UDP 客户端通过 TCP 建立 `UDP ASSOCIATE` 后，向回复中的地址和端口发送 SOCKS5 UDP 数据报；TCP 连接关闭时 UDP 会话随之结束。仅接受来自该 TCP 客户端地址及指定 UDP 端口的数据报；请求端口为 0 时，使用首个成功转发的有效数据报的来源端口。无效报文不会锁定端口。UDP 回复必须来自最近 60 秒内成功转发过的目标地址和端口，每个会话最多记录 64 个目标。UDP 分片（`FRAG` 非 0）不受支持。
-
-TCP 和 UDP 的 IPv4/IPv6 数字地址直接用于连接或转发，无需转换为文本或调用地址解析器；域名目标仍使用系统解析器。IPv4 映射的 IPv6 目标（如 `::ffff:127.0.0.1`）在 TCP 和 UDP 中均通过 IPv4 套接字转发，回复使用 IPv4 地址格式；域名解析返回此类地址时也做相同处理。支持 IPv6 监听地址，例如 `tinysocks ::1 1080`，以及 IPv6 客户端的 UDP 会话。
-
-以域名格式（`ATYP=3`）提交的标准 IPv4/IPv6 字面量（如 `127.0.0.1`、`::1`、`::ffff:127.0.0.1`）也直接转换为数字地址，不调用解析器或占用 DNS 名额；UDP 中也不占用域名缓存。即使全部后台解析任务阻塞，这些目标仍可连接或转发。IPv4 缩写、带前导零的写法及带作用域的 IPv6 等未识别形式仍交给系统解析器，保留原有解释方式。
-
-UDP 每个会话最多缓存 8 个成功转发的域名地址，固定缓存 60 秒，命中时无需再次解析，同一域名的不同端口共用 IP 地址缓存。仅包含 ASCII 字母、数字、连字符、下划线和点的名称按 ASCII 大小写不敏感比较，共享一项缓存；解析器仍收到原始拼写。带尾点的绝对名称与不带尾点的名称分别缓存；作用域、转义或非 ASCII 等特殊输入仍按原文比较。命中不会延长过期时间，即使解析名额全部被阻塞任务占满，也可转发缓存中的大小写变体。缓存发送失败时立即重新解析并尝试候选地址；解析或发送失败不会写入缓存。该缓存期限独立于 DNS 记录的 TTL，地址变更最迟在缓存到期后的下一次请求时重新解析。首次解析在后台线程执行，会话等待结果的上限取连接预算和剩余空闲预算中的较短值；超时请求被丢弃，不会锁定客户端端口、写入缓存或刷新空闲计时。
-
-最多同时处理 64 个客户端会话；认证收发和请求字段读取共享 15 秒预算，TCP 目标域名解析和全部候选地址共享 10 秒连接预算。目标域名仍使用系统解析器，在后台线程执行，等待结果的时间计入预算；数字目标地址和 UDP 缓存命中均无需创建解析任务。连接或 UDP 绑定完成后，协议回复发送另有 15 秒上限；发送失败会立即回收会话。已建立的 TCP 或 UDP 会话连续空闲 5 分钟后关闭；无效或来源不符的 UDP 报文，以及 UDP 会话的 TCP 控制数据，不会刷新空闲计时。
-
-完整收发所需字节后仍会核对本次收发的原截止时间。若线程在最后一次成功收发时跨过期限，该步骤仍按超时处理，关闭会话；握手字段读取超时后不会取得新的连接预算或建立 UDP 关联。已经传输的字节不会撤回。内部回归在真实套接字成功收发后推进时钟，验证最后一个请求端口字节到达时超时的 TCP/UDP 请求均停止后续建立，正常请求仍可继续，收发载荷保持完整。
-
-等待就绪事件返回后，会再次核对原有截止时间。若进程被暂停或线程迟迟未获得调度，恢复等待时已超过空闲期限的 TCP/UDP 会话会关闭，迟到的就绪事件不能刷新空闲计时。TCP 连接在等待返回和接受成功候选前也核对连接预算；已超时的候选会关闭并返回状态 `4`。
-
-整个进程最多同时执行 8 个目标域名解析任务。名额不足时，会话在原有截止时间内等待，已有任务结束后继续解析；等待不会延长连接或空闲预算。系统解析调用结束前始终占用名额，客户端等待超时或 UDP 控制连接关闭不会额外创建替代任务；迟到的解析结果自动回收，不会用于后续连接或转发。这样即使系统解析器长时间阻塞，也不会持续增加后台线程数量。启动时监听地址的解析仍由主线程直接执行。
-
-UDP 转发循环及等待域名解析或解析名额时，都会检查 TCP 控制连接。收到 EOF 或连接错误后立即结束会话，丢弃待转发的数据报，不等待系统解析返回；尚未结束的后台解析继续占用原有名额，完成后回收结果。控制连接中的数据仍被忽略，不刷新空闲预算，也不会覆盖待转发的 UDP 载荷。每次清理只读取已取得的接收队列长度，再检查 EOF 或错误并继续处理；持续新增的控制数据不会无限延长一次清理。普通转发循环同样先处理控制连接，再处理同一轮就绪的 UDP 请求和回复，数字地址和缓存命中也遵循这一顺序。TCP `CONNECT` 保持原有半关闭支持，域名解析期间发送 FIN 仍可在连接成功后接收回复。
-
-普通 UDP 循环在读取数据报前，复用已有的 64 KiB 报文缓冲区来丢弃控制数据，减少接收调用，不增加会话缓冲区。DNS 等待仍使用独立的 1 KiB 小缓冲区，避免覆盖待发报文；两处共用相同的接收队列快照、EOF/错误和截止时间检查。
-
-TCP 在目标解析、解析名额排队和连接候选等待期间检查客户端套接字错误，阻塞等待的检查间隔不超过 50 毫秒。客户端发生重置等错误时停止建立目标连接，回收待连接套接字和客户端名额；已运行的系统解析仍保持原有后台名额，返回后释放迟到结果。检查错误状态并用 `MSG_PEEK` 查看接收状态，不读取待转发的应用数据；FIN 和未读载荷均不会取消正常请求，也不会造成持续的可读事件忙循环。解析与连接仍使用同一超时预算。
-
-已建立的 TCP 会话因背压暂停监听某个端点时，仍以不超过 50 毫秒的阻塞等待间隔检查该端点的错误。客户端或目标发生重置后及时释放会话名额，无需等待五分钟空闲超时；正常 FIN 和待转发数据仍按原有半关闭规则处理。定时检查不刷新空闲预算。
-
-域名 TCP 连接优先尝试解析器返回的首个可用地址族，之后交替尝试 IPv4、IPv6，保留每个地址族内的解析顺序。连接尚未完成时，每隔 250 毫秒尝试下一个候选；已知失败时立即尝试后续候选，避免首个慢地址独占连接预算。每个会话最多保留 8 个待连接套接字，达到上限时等待已有尝试完成，再补充候选。首个成功的连接用于转发，其余套接字立即关闭；数字地址仍仅连接指定目标。访问被系统拒绝时返回 SOCKS5 状态 `2`，连接被目标拒绝时返回状态 `5`，整个连接预算耗尽时返回状态 `4`。
-
-可在编译时用 `-DMAX_CLIENTS=数量`、`-DMAX_RESOLVERS=数量`、`-DHANDSHAKE_TIMEOUT_SECONDS=秒数`、`-DCONNECT_TIMEOUT_SECONDS=秒数` 和 `-DIDLE_TIMEOUT_SECONDS=秒数` 调整。客户端和解析任务数量须为正数且不超过 `UINT_MAX`，超时须为正数且毫秒值不超过 `INT_MAX`。`CONNECT_TIMEOUT_SECONDS` 同时决定 TCP 解析与连接的总预算，以及 UDP 单次域名解析的最大等待时间。代理不提供身份认证；监听公网地址时，请自行限制访问来源。
-
-单个待接入连接中断或出现临时网络错误时，监听循环会继续处理后续连接。文件描述符、套接字缓冲区或内存暂时不足时，每次等待 100 毫秒再重试，避免退出服务或持续忙循环。接入后的内存分配或工作线程创建失败时，先关闭连接、释放参数和客户端名额，再等待 100 毫秒；资源恢复后可继续接入。不可恢复的监听错误仍会记录并退出。
-
-## 测试
-
-安装 Zig、GNU Make 和 Python 3 后运行：
+以下示例使用本机编译后的程序名；使用发布附件时替换为对应文件名。
 
 ```sh
-make test
+./tinysocks 127.0.0.1 1080  # 仅 IPv4 本机访问，建议从这里开始
+./tinysocks ::1 1080        # 仅 IPv6 本机访问
+./tinysocks 0.0.0.0 1080    # 所有 IPv4 接口，需自行限制访问来源
+./tinysocks 127.0.0.1 0     # 由系统分配端口，实际端口见启动日志
+./tinysocks --help          # 或 -h
 ```
 
-测试会自动编译专用程序，使用 2 个客户端、1 秒握手和 3 秒空闲限制。使用系统分配的监听端口，无需预留端口或建立探测连接。覆盖命令行参数和帮助、实际监听地址、协议拒绝、最大认证方法列表、截断及分段握手、握手与应用数据连发后半关闭、IPv4/IPv6 监听与目标、域名和 TCP/UDP IPv4 映射地址、双向转发背压、大数据半关闭、客户端数量限制，以及 UDP 来源校验、端口锁定、发送失败后重新识别客户端端口、空载荷与大报文、空闲超时和会话回收；无效 UDP 报文和 TCP 控制数据均不能延长 UDP 会话寿命。不需要访问外网，IPv6 回环不可用时跳过相应测试。
+- 不传参数时监听 `0.0.0.0:1080`；只传监听地址时端口为 `1080`。
+- 端口必须为 `0` 至 `65535` 的十进制数字。不能省略地址、只传端口。
+- IPv6 监听地址作为独立参数直接填写，不加方括号；启动日志会显示为 `[::1]:1080`。
+- 监听 IPv6 通配地址时，不应假定它同时接收 IPv4；具体行为取决于系统设置。
 
-大 UDP 报文回归分别使用 IPv4/IPv6 客户端及目标，验证空载荷、8 KiB、16 KiB、48 KiB，以及各地址组合的最大可封装载荷的完整请求及回复：IPv4 客户端对应 IPv4/IPv6 目标为 65,497/65,485 字节，IPv6 客户端对应 IPv4/IPv6 目标为 65,507/65,505 字节。测试端点显式设置足够的收发容量，验证代理自身的数据报处理。普通、故障注入及实际发布附件均执行这些检查；macOS 内部检查还覆盖发送容量查询和设置失败后的回收、重试，以及保留更大容量。
+## 从源码编译
 
-同一回归还覆盖目标合法、加上 SOCKS5 头后超出客户端 UDP 长度限制的回复。在三个可能超限的地址组合中，分别发送仅超限一字节及目标允许的最大报文，确认整份报文被丢弃而非截短转发。随后不发送新请求，直接由原目标发送正常回复，确认关联与目标许可仍然可用。IPv6 客户端接收 IPv4 目标回复时，目标允许的全部载荷均能封装，保留最大合法回复检查。
+需要 [Zig](https://ziglang.org/download/) 和 GNU Make；运行测试另需 Python 3。当前 [CI 工作流](.github/workflows/build-release.yml) 使用 Zig **0.16.0**。
 
-Windows 上默认使用 `python`，其他平台使用 `python3`；可通过 `make test PYTHON=解释器路径` 指定解释器。
+```sh
+git clone https://github.com/Antman2023/TinySocks.git
+cd TinySocks
+make host
+./tinysocks 127.0.0.1 1080
+```
 
-`make test` 使用与本机发布程序相同的优化和链接参数。`make test-release` 则编译并测试默认运行限制的本机程序；跨平台附件也可用 `python tests/test_proxy.py 程序路径 --release -v` 检查。发布测试保留 TCP/UDP、域名、IPv4/IPv6、背压和半关闭等协议检查，仅跳过依赖短超时或两客户端限制的检查及故障注入专用检查；这些检查仍由 `make test` 和内存检查任务执行。
+Windows 的本机输出为 `tinysocks.exe`，在 PowerShell 中使用 `.\tinysocks.exe` 启动。
 
-CI 还通过 [QEMU 用户模式](https://www.qemu.org/docs/master/user/main.html)分别运行实际的 Linux ARM64、ARMv7、大端 MIPS 和小端 MIPSel 发布附件，执行同一套发布协议测试。Linux 主机安装 `qemu-user` 后可使用 `python3 tests/test_proxy.py dist/tinysocks-linux-mips --release --runner qemu-mips -v` 复现；其他架构分别使用 `qemu-aarch64`、`qemu-arm` 和 `qemu-mipsel`。模拟运行时跳过下述本机地址空间限制检查，避免把模拟器自身的内存开销算入代理限制；本机 Linux 检查仍执行。四个模拟测试均通过后才允许发布版本。
+| 命令 | 输出 |
+| --- | --- |
+| `make host` | 当前系统程序：`tinysocks` 或 `tinysocks.exe` |
+| `make` 或 `make mipsel` | 小端 MIPS 静态程序：`tinysocks-mipsel` |
+| `make mips` | 大端 MIPS 静态程序：`tinysocks-mips` |
+| `make release` | 九种发布程序，位于 `dist/` |
+| `make cross-fault-tests` | 四种 Linux 跨架构故障测试程序，位于 `test-bin/` |
 
-四种架构也使用相应发布程序的优化、LTO、静态链接及 1 MiB 线程栈参数交叉编译故障程序，执行全部内部检查及与本机相同的故障协议测试，覆盖解析期限、取消、名额保持、通知资源回收、监听恢复和短收发。使用 `make cross-fault-tests` 构建后，可通过 `qemu-mips test-bin/tinysocks-fault-linux-mips --test-internals` 运行 MIPS 内部检查。故障程序及其校验文件保存在独立的 Actions 附件中，正式 Release 仍只包含九个程序和发布校验文件；跨架构故障检查同样属于发布门禁。
+> 注意：裸 `make` 的默认目标是 **MIPSel**，不是当前电脑。日常本机编译请使用 `make host`。
 
-过期就绪回归只对被测线程推进模拟时钟；观察线程使用真实时钟保留 400 毫秒的关闭检查上限，避免被测线程的时钟跳变使观察本身提前超时。TCP 检查先开始观察预算，再等待被测线程完成时钟推进，确认它仍及时关闭且没有转发迟到数据。MIPS 夹具的通知管道也接受成功创建后的正返回值，继续验证实际通知读写。
+构建规则及完整交叉编译参数见 [Makefile](Makefile)。MIPS hard-float 设备需要自行使用 `musleabihf` 目标构建。Linux 构建中的 `-Wl,-z,stack-size=1048576` 用于 musl 线程栈设置，自定义静态编译时应保留；背景及各平台直接编译命令见[技术说明](docs/technical-notes.md#编译)。
 
-Zig 0.16.0 的 MIPS/MIPSel `pipe` 包装在成功创建管道时会返回首个文件描述符的正数值。DNS 通知管道以负返回值判断失败，并继续配置及验证两个描述符，避免把已成功创建的管道误判为失败而取消解析。内部回归在 Linux/macOS 的真实管道上模拟该返回值，验证 TCP/UDP 域名解析、管道和任务回收及后续解析恢复；四种模拟附件的完整协议测试另覆盖实际的 `localhost` TCP 转发与 UDP 大小写、不同目标端口转发。模拟测试失败时 CI 会输出域名连接的系统调用跟踪，便于定位资源准备或解析故障。
+### 编译时配置
 
-Linux 正式附件另在 128 MiB 进程地址空间限制下同时保持默认的 64 个 UDP 会话，确认每个会话可完整转发最大 IPv4 载荷及域名报文，并报告进程的虚拟内存、驻留内存和线程数。该检查只约束代理子进程，不限制测试进程；其他系统及短期限测试程序跳过它。
+这些是编译期宏，不是命令行选项或环境变量：
 
-测试还验证 UDP 域名缓存的不同端口转发、固定过期、容量淘汰和失败重解析；受控解析器确认同一域名的 16 种大小写变体连续发送 100 个数据报只调用一次解析器、只占一项缓存。覆盖尾点、ASCII 编码的国际化域名、下划线、作用域、转义和非 ASCII 输入的缓存边界，并检查原始解析拼写和失败重解析。端到端故障测试先填满解析名额，再验证缓存名称的大小写变体仍能向不同端口转发并接收回复。故障注入程序先模拟连接中断与资源不足，再执行 TCP/UDP 和 IPv6 端到端测试，验证监听服务能够恢复。GitHub Actions 的三个系统均执行这些检查。
+| 宏 | 默认值 | 含义 |
+| --- | --- | --- |
+| `MAX_CLIENTS` | `64` | 同时处理的客户端会话上限 |
+| `MAX_RESOLVERS` | `8` | 整个进程同时执行的目标域名解析任务上限 |
+| `HANDSHAKE_TIMEOUT_SECONDS` | `15` | 方法协商与请求字段读取的共享预算；协议回复另有同样时长的发送上限 |
+| `CONNECT_TIMEOUT_SECONDS` | `10` | TCP 解析和全部连接候选的总预算；也限制 UDP 单次域名解析等待 |
+| `IDLE_TIMEOUT_SECONDS` | `300` | 已建立 TCP/UDP 会话的连续空闲上限 |
 
-TCP 故障测试模拟首批地址迟迟无法连接，验证备用地址在同一预算内成功转发、IPv4/IPv6 交替尝试、全部候选共享超时，以及成功或失败后回收待连接套接字；同时检查异步连接拒绝和系统访问拒绝的回复状态。故障注入程序的连接预算缩短为 1 秒，无需依赖外部网络或真实的不可达地址。
+例如，在 Linux 上直接编译，将并发会话上限调整为 128：
 
-慢解析测试让系统解析器延迟 2 秒，验证 TCP 在 1 秒预算内返回失败、UDP 超时请求不锁定端口，且迟到的结果不会连接目标或转发数据；接近空闲截止时间的 UDP 解析也不能延长会话寿命。内部检查还覆盖解析名额耗尽、排队恢复、迟到结果释放，以及内存、通知资源和线程创建失败后的回收。故障程序以 2 个解析任务为上限运行，这些检查已纳入 `make test` 和三个系统的 GitHub Actions。
+```sh
+zig cc -std=c11 -O2 -flto -Wall -Wextra \
+  -ffunction-sections -fdata-sections \
+  -Wl,--gc-sections -Wl,-z,stack-size=1048576 -s \
+  -DMAX_CLIENTS=128 tinysocks.c -o tinysocks -pthread
+```
 
-解析任务取得名额后，以及事件或管道和线程属性准备完成后，均复核剩余预算与客户端状态。准备期间预算耗尽、TCP 客户端重置或 UDP 控制连接关闭时，不启动解析线程，立即回收通知资源、任务内存及解析名额。内部回归在资源准备阶段推进时钟或关闭真实连接，验证上述四种情形均未创建线程、资源已关闭且后续解析可恢复；正常 TCP 数据加半关闭仍可解析，待转发数据与 EOF 保持完整。
+数量必须为正数且不超过 `UINT_MAX`；超时必须为正数，换算成毫秒后不能超过 `INT_MAX`。增大会话上限会增加潜在资源需求，请按目标设备验证。
 
-解析线程首次获得调度时还会检查调用方原有的截止时间，已经过期则跳过系统解析，发送完成通知并回收任务与名额；仍在预算内才调用解析器，不从线程入口重新计算预算。已经进入系统解析器的任务仍按原有生命周期完成和回收。内部回归用真实线程和受控时钟分别验证 TCP/UDP 的过期与有效入口，检查解析调用次数、通知资源关闭及后续解析恢复。
+## UDP、DNS 与部署注意事项
 
-调用方因超时、TCP 重置或 UDP 控制连接关闭而停止等待时，还会在任务中记录取消状态。尚未进入解析器的线程即使原预算仍有效，也会跳过解析；线程只读取任务自身的状态，不访问调用方可能已关闭或复用的套接字。任务内存、通知资源及解析名额仍保留至后台线程实际结束；已经开始的系统解析不会被强制中断。内部回归先暂停真实线程，关闭连接并等待调用方退出，再释放线程，确认 TCP 重置与 UDP 关闭均不调用解析器，且资源回收、后续解析及正常 TCP 半关闭和待转发数据保持正常。
+### UDP 会话
 
-UDP 关闭回归还使用 600 毫秒解析延迟，验证控制连接关闭后即使 DNS 在预算内成功返回，也不会转发数据报；控制连接含有未读数据时同样成立。发送端半关闭须在 400 毫秒内结束 UDP 会话，迟到结果不会转发；控制数据与等待中的 UDP 载荷使用独立缓冲区。内部检查验证解析中及名额满时的取消、迟到结果释放、后台名额保持，以及 Windows 控制事件创建或注册失败后的恢复；同时验证慢域名 TCP 连接的半关闭仍能收发数据。持续可读的受控控制输入还验证已就绪的 DNS 结果能在原预算内继续处理、UDP 载荷完整转发，以及接收队列查询中断后重试和错误后取消。另以真实 TCP 接收队列确认 200 KiB 控制数据已全部到达，再同步放行 UDP 请求：控制连接仍打开时须完整转发，数据后紧跟半关闭时须先结束会话，不能向数字目标转发同轮请求。
+客户端先通过 TCP 建立 `UDP ASSOCIATE`，再向回复中的地址和端口发送 SOCKS5 UDP 数据报。**TCP 控制连接必须保持打开**；关闭或发送 EOF 会结束对应 UDP 会话。
 
-TCP 重置回归确认两个受控解析任务已阻塞后，再让客户端异常关闭；在解析中及名额已满时，均须在 400 毫秒内恢复新客户端接入并成功转发数字目标。600 毫秒解析延迟还验证异常关闭后不会连接迟到的目标。内部检查覆盖解析前、解析中、名额排队和连接候选等待中的取消，确认待连接套接字全部回收、后台名额保持至解析返回，并释放迟到结果；正常 FIN 带 30 KiB 待转发载荷仍须完整传递和接收回复。真实 `localhost` 的 UDP 大小写变体与不同目标端口检查纳入常规及正式附件测试。
+- 只接收来自该 TCP 客户端 IP 的数据报，并校验 UDP 端口。请求端口为 `0` 时，以首个成功转发的有效数据报锁定来源端口。
+- 只转发最近 60 秒内成功访问过的目标地址与端口的回复；每会话最多记录 64 个目标。
+- 无效报文、来源不匹配报文及 TCP 控制数据不会刷新空闲计时。
+- UDP 关联使用系统分配的端口。跨设备使用时，防火墙仅放行 TCP `1080` 不足以支持 UDP；还需允许关联端口及所需的 UDP 出站/回包流量，并限制可信来源。
+- 数据报加上 SOCKS5 头后仍须满足所用 IP 版本的 UDP 长度限制，无法封装的回复会被整份丢弃，不会截短转发。
 
-背压重置回归分别填满客户端上传和目标下载方向，保留停止读取的接收端，并验证反向流量仍可传递；发送端重置后，在另一正常会话持续占用名额时，须在 400 毫秒内允许新客户端接入并完成双向转发。正常半关闭回归同样填满两个方向，发送 FIN 后暂停读取 200 毫秒，再验证数据完整传递、EOF 顺序和反向回复；该检查也覆盖正式程序。三项检查均在 Linux 内存检查任务中执行。
+### 域名解析
 
-双向传输回归在真实 TCP 连接上同时上传和下载两个不同的 1 MiB 随机数据流，确认两个方向的字节均完整且顺序正确，数据发送完毕后才传递半关闭；普通测试及实际发布附件均执行该检查。故障程序进一步限制单次读写长度，并受控返回收发中断及暂时不可读写错误，测试确认各类故障实际触发。故障调度和计数分别保存在各工作线程中，不影响其他故障测试。短读写故障回归纳入三个系统的 `make test` 及 Linux 内存检查。
+- 数字 IPv4/IPv6 目标不需要 DNS。标准数字字面量即使通过域名格式提交，也会直接解析为数字地址。
+- TCP 域名连接按解析结果交替尝试 IPv4/IPv6 候选；未完成时每隔 250 毫秒尝试后续候选，已知失败时立即继续，全部候选共享连接预算。
+- UDP 每会话最多缓存 8 个成功转发的域名地址，固定有效期为 60 秒，不随命中续期；同一域名的不同端口共用地址缓存。
+- UDP 缓存的有效期独立于 DNS 记录 TTL。常规 ASCII 名称不区分大小写，带尾点与不带尾点的名称分别缓存。
+- 系统解析器运行于受限后台线程。客户端超时或离开不会强制中断已开始的系统解析；任务结束前继续占用解析名额，迟到结果会回收。
 
-数字字面量回归在普通配置和解析名额被阻塞任务占满时，分别验证域名格式的 IPv4、IPv6、映射 IPv6 的 TCP/UDP 转发及 TCP 半关闭。内部检查确认连续 100 个数字字面量 UDP 请求不调用解析器、不写入域名缓存，并验证缩写、前导零、作用域等形式仍走原有解析路径。
+### 平台差异
 
-Linux CI 还使用 Clang 的 AddressSanitizer 和 UndefinedBehaviorSanitizer 执行内部故障检查及域名转发测试，检测解析任务生命周期中的内存泄漏、释放后访问及未定义行为；通过后才继续构建发布程序。
+Windows 对 TCP 监听和 UDP 套接字使用独占地址绑定。Linux/macOS 的 TCP 监听使用 `SO_REUSEADDR`；macOS 不能提供相同的独占保证，需避免通配地址与具体地址的重叠绑定。macOS UDP 套接字也会调整发送容量以支持较大数据报。详细行为及失败处理见[技术说明](docs/technical-notes.md#运行)。
 
-内部超时回归在真实套接字数据或连接结果已就绪后推进受控单调时钟，验证 TCP 双向载荷及 UDP 回复不能延长已超时的会话；连接等待返回后，以及读取成功连接状态时越过预算，均须返回超时并关闭候选套接字。这些检查不需要暂停 CI 进程或额外等待完整空闲期限。
+## 测试与发布流程
 
-UDP 回复来源检查使用 65 个真实回环目标端口和受控单调时钟，验证未访问端口、过期及容量淘汰的目标回复被丢弃。成功请求可以更新目标许可，回复和发送失败均不能延长许可；刷新已有目标不能挤掉其他目标。允许的回复还须保留来源地址、端口和载荷。这些检查随内部测试在三个系统及 Linux 内存检查任务中执行，无需等待真实的 60 秒期限。
+```sh
+make test          # 短超时/低并发限制的协议回归、内部检查和故障注入
+make test-release  # 使用默认运行限制的本机程序进行协议回归
+```
 
-IPv4/IPv6 通配监听回归分别使用默认选项和 `SO_REUSEADDR`，检查已有监听端点不能被重复监听；失败尝试后仍须完成真实 TCP 请求、回复和双向半关闭。Windows 和 Linux 还检查回环地址不能覆盖通配监听，以及已有回环监听占用端口时代理不能作为通配监听启动。macOS 按系统支持的重复通配端点规则检查，跳过其允许的通配/具体地址复用断言。这些检查也覆盖正式附件和故障程序。
+测试使用本地回环连接，不依赖外网；IPv6 回环不可用时跳过相应检查。Windows 默认使用 `python`，其他系统使用 `python3`，可通过 `make test PYTHON=解释器路径` 覆盖。
 
-Windows UDP 回归在 IPv4/IPv6 控制连接下分别检查两种出站地址族的端口及关联端口，尝试默认选项和 `SO_REUSEADDR` 的竞争绑定，再验证空载荷、完整回复和后续请求仍通过原出站端口转发。关联端口绑定于具体地址时，系统可以允许通配绑定服务其他接口；检查会保持竞争套接字打开，确认它无法接走当前关联的数据。这些检查覆盖正式附件和故障程序。Windows 内部检查另模拟独占配置返回 `WSAENOBUFS` 或 `WSAEACCES`，验证失败套接字已关闭、请求未转发、许可与缓存未写入，以及重新解析、重试和新 UDP 关联能恢复。
+还可以检查下载的发布程序：
+
+```sh
+python3 tests/test_proxy.py ./tinysocks-linux-x86_64 --release -v
+```
+
+CI 在 `master` 推送、Pull Request、`v*` 标签推送及手动触发时执行：
+
+1. Linux、Windows、macOS 协议与故障回归，以及 Linux AddressSanitizer/UndefinedBehaviorSanitizer 检查。
+2. 构建九种发布程序和四种 Linux 跨架构故障程序，生成 SHA-256 校验文件。
+3. 在三个系统测试实际发布附件，并通过 QEMU 测试 ARM64、ARMv7、MIPS、MIPSel 发布及故障附件。
+4. 仅在 `v*` 标签构建通过发布所需检查后创建 GitHub Release；普通分支构建的产物可从 Actions 下载。
+
+测试涵盖握手、TCP/UDP 转发、IPv4/IPv6、背压、半关闭、超时、DNS 缓存和取消、来源校验及资源回收。完整回归细节见[技术说明](docs/technical-notes.md#测试)，执行入口见 [tests/test_proxy.py](tests/test_proxy.py) 与 [tests/test_faults.c](tests/test_faults.c)。
+
+## 常见问题
+
+**启动后其他设备连不上？** 绑定 `127.0.0.1` 或 `::1` 时仅允许本机访问。确认监听地址、启动日志、系统防火墙和网络路由；开放网络接口前先限制可信来源。
+
+**TCP 可以用，UDP 不通？** 确认客户端支持 SOCKS5 UDP、保持 TCP 控制连接打开，并能访问服务端返回的 UDP 端点。只支持 TCP 的代理设置不会自动获得 UDP 转发能力。
+
+**提示 `Could not listen`？** 检查地址是否属于本机、端口是否已被占用，以及当前账户是否有绑定权限；可以先用 `127.0.0.1 0` 验证。
+
+**下载后无法执行？** Linux/macOS 先设置执行权限，再检查系统、CPU 架构及 ABI。不要仅凭设备厂商或“MIPS”名称选择大小端版本。
+
+**可以直接作为公网代理吗？** 不建议。任何能连接监听端口的人都可使用这个无认证代理，并可能访问服务器能够访问的网络目标；请通过外部网络访问控制保护它。
