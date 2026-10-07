@@ -528,7 +528,8 @@ static int resolve_target(const char *host, const char *port, const struct addri
     int result = EAI_AGAIN;
     if (completed && resolver_control_open(control, mode, deadline_ms) &&
         atomic_load_explicit(&job->completed, memory_order_acquire) &&
-        job->completed_at_ms <= deadline_ms) {
+        job->completed_at_ms < deadline_ms && remaining_milliseconds(deadline_ms)) {
+        /* A timely worker result can still be observed after the caller expires. */
         result = job->error;
         if (!result) {
             *addresses = job->addresses;
@@ -856,11 +857,13 @@ static void relay(socket_t client, socket_t target) {
             if (events & POLLNVAL) return;
             struct relay_buffer *out = &buffers[1 - i];
             if (out->length && (events & (POLLOUT | POLLERR | POLLHUP))) {
+                if (!remaining_milliseconds(deadline_ms)) return;
                 size_t contiguous = sizeof(out->data) - out->offset;
                 if (contiguous > out->length) contiguous = out->length;
                 int n = send(sockets[i], (const char *)out->data + out->offset,
                              (int)contiguous, 0);
                 if (n > 0) {
+                    if (!remaining_milliseconds(deadline_ms)) return;
                     out->offset = (out->offset + (size_t)n) % sizeof(out->data);
                     out->length -= (size_t)n;
                     if (!out->length) out->offset = 0;
@@ -872,6 +875,7 @@ static void relay(socket_t client, socket_t target) {
             struct relay_buffer *in = &buffers[i];
             if (in->read_open && in->length < sizeof(in->data) &&
                 (events & (POLLIN | POLLERR | POLLHUP))) {
+                if (!remaining_milliseconds(deadline_ms)) return;
                 /* A ring keeps unsent bytes in place under backpressure. */
                 size_t tail = (in->offset + in->length) % sizeof(in->data);
                 size_t contiguous = sizeof(in->data) - tail;
@@ -879,6 +883,7 @@ static void relay(socket_t client, socket_t target) {
                     contiguous = sizeof(in->data) - in->length;
                 int n = recv(sockets[i], (char *)in->data + tail, (int)contiguous, 0);
                 if (n > 0) {
+                    if (!remaining_milliseconds(deadline_ms)) return;
                     in->length += (size_t)n;
                     deadline_ms = monotonic_milliseconds() + IDLE_TIMEOUT_SECONDS * 1000;
                 } else if (n == 0) {
@@ -1036,7 +1041,8 @@ static int known_udp_destination(const struct udp_destination *destinations,
 static int send_udp_request(const unsigned char *payload, size_t length,
                             struct sockaddr_storage *destination,
                             socket_t *ipv4, socket_t *ipv6,
-                            struct udp_destination *destinations) {
+                            struct udp_destination *destinations, uint64_t deadline_ms) {
+    if (!remaining_milliseconds(deadline_ms)) return 0;
     /* Winsock IPv6 sockets may reject mapped IPv4 destinations by default. */
     normalize_ipv4_mapped(destination);
     socket_t *outbound = destination->ss_family == AF_INET ? ipv4 : ipv6;
@@ -1049,9 +1055,10 @@ static int send_udp_request(const unsigned char *payload, size_t length,
         }
     }
     socklen_t destination_length = address_length(destination);
-    if (*outbound == INVALID_FD ||
+    if (*outbound == INVALID_FD || !remaining_milliseconds(deadline_ms) ||
         sendto(*outbound, (const char *)payload, (int)length, 0,
-               (const struct sockaddr *)destination, destination_length) != (int)length)
+               (const struct sockaddr *)destination, destination_length) != (int)length ||
+        !remaining_milliseconds(deadline_ms))
         return 0;
     remember_udp_destination(destinations, (const struct sockaddr *)destination,
                              destination_length);
@@ -1113,7 +1120,7 @@ static int forward_udp_request(const unsigned char *packet, size_t length,
         /* Numeric addresses already contain everything needed by sendto. */
         set_address_port(&destination, target_port);
         return send_udp_request(packet + offset, length - offset, &destination,
-                                ipv4, ipv6, destinations);
+                                ipv4, ipv6, destinations, deadline_ms);
     }
     snprintf(port, sizeof(port), "%u", (unsigned)target_port);
 
@@ -1124,7 +1131,7 @@ static int forward_udp_request(const unsigned char *packet, size_t length,
             destination = dns_cache[i].address;
             set_address_port(&destination, target_port);
             if (send_udp_request(packet + offset, length - offset, &destination,
-                                 ipv4, ipv6, destinations)) return 1;
+                                 ipv4, ipv6, destinations, deadline_ms)) return 1;
             /* Retry resolution and other candidates after a cached send fails. */
             dns_cache[i].expires_at_ms = 0;
         }
@@ -1154,7 +1161,7 @@ static int forward_udp_request(const unsigned char *packet, size_t length,
         memset(&destination, 0, sizeof(destination));
         memcpy(&destination, address->ai_addr, address->ai_addrlen);
         if (send_udp_request(packet + offset, length - offset, &destination,
-                             ipv4, ipv6, destinations)) {
+                             ipv4, ipv6, destinations, deadline_ms)) {
             strcpy(dns_cache[slot].host, host);
             dns_cache[slot].address = destination;
             dns_cache[slot].expires_at_ms = monotonic_milliseconds() +
@@ -1170,12 +1177,13 @@ static int forward_udp_request(const unsigned char *packet, size_t length,
 static int forward_udp_reply(socket_t outbound, socket_t association,
                               const struct sockaddr_storage *client_address,
                               unsigned char *packet,
-                              const struct udp_destination *destinations) {
+                              const struct udp_destination *destinations, uint64_t deadline_ms) {
+    if (!remaining_milliseconds(deadline_ms)) return 0;
     struct sockaddr_storage source;
     socklen_t source_length = (socklen_t)sizeof(source);
     int count = recvfrom(outbound, (char *)packet + 22, UDP_BUFFER_SIZE - 22, 0,
                          (struct sockaddr *)&source, &source_length);
-    if (count < 0) return 0;
+    if (count < 0 || !remaining_milliseconds(deadline_ms)) return 0;
     normalize_ipv4_mapped(&source);
     if (!known_udp_destination(destinations, &source)) return 0;
     size_t header_length;
@@ -1201,9 +1209,11 @@ static int forward_udp_reply(socket_t outbound, socket_t association,
     reply[1] = 0;
     reply[2] = 0;
     int reply_length = count + (int)header_length;
-    return sendto(association, (const char *)reply, reply_length, 0,
+    return remaining_milliseconds(deadline_ms) &&
+           sendto(association, (const char *)reply, reply_length, 0,
                   (const struct sockaddr *)client_address,
-                  address_length(client_address)) == reply_length;
+                  address_length(client_address)) == reply_length &&
+           remaining_milliseconds(deadline_ms);
 }
 
 static void udp_associate(socket_t client, unsigned short requested_port) {
@@ -1281,10 +1291,10 @@ static void udp_associate(socket_t client, unsigned short requested_port) {
             }
         }
         if (client_known && ipv4_index >= 0 && readable[ipv4_index].revents)
-            if (forward_udp_reply(ipv4, association, &udp_client, packet, destinations))
+            if (forward_udp_reply(ipv4, association, &udp_client, packet, destinations, deadline_ms))
                 deadline_ms = monotonic_milliseconds() + IDLE_TIMEOUT_SECONDS * 1000;
         if (client_known && ipv6_index >= 0 && readable[ipv6_index].revents)
-            if (forward_udp_reply(ipv6, association, &udp_client, packet, destinations))
+            if (forward_udp_reply(ipv6, association, &udp_client, packet, destinations, deadline_ms))
                 deadline_ms = monotonic_milliseconds() + IDLE_TIMEOUT_SECONDS * 1000;
     }
     goto done;

@@ -35,6 +35,8 @@ static int injected_getsockopt(SOCKET, int, int, char *, int *);
 static int injected_setsockopt(SOCKET, int, int, const char *, int);
 static int injected_recv(SOCKET, char *, int, int);
 static int injected_send(SOCKET, const char *, int, int);
+static int injected_recvfrom(SOCKET, char *, int, int, struct sockaddr *, int *);
+static int injected_sendto(SOCKET, const char *, int, int, const struct sockaddr *, int);
 static int injected_ioctlsocket(SOCKET, long, u_long *);
 static int injected_wsa_poll(WSAPOLLFD *, ULONG, INT);
 static ULONGLONG injected_tick_count(void);
@@ -44,6 +46,8 @@ static HANDLE injected_create_thread(LPSECURITY_ATTRIBUTES, SIZE_T, LPTHREAD_STA
                                       LPVOID, DWORD, LPDWORD);
 static WSAEVENT injected_wsa_create_event(void);
 static int injected_wsa_event_select(SOCKET, WSAEVENT, long);
+static DWORD injected_wait_single(HANDLE, DWORD);
+static DWORD injected_wait_multiple(DWORD, const HANDLE *, BOOL, DWORD);
 #else
 static int injected_accept(int, struct sockaddr *, socklen_t *);
 static int injected_connect(int, const struct sockaddr *, socklen_t);
@@ -54,6 +58,8 @@ static int injected_setsockopt(int, int, int, const void *, socklen_t);
 #endif
 static ssize_t injected_recv(int, void *, size_t, int);
 static ssize_t injected_send(int, const void *, size_t, int);
+static ssize_t injected_recvfrom(int, void *, size_t, int, struct sockaddr *, socklen_t *);
+static ssize_t injected_sendto(int, const void *, size_t, int, const struct sockaddr *, socklen_t);
 static int injected_ioctl(int, unsigned long, int *);
 static int injected_poll(struct pollfd *, nfds_t, int);
 static int injected_clock_gettime(clockid_t, struct timespec *);
@@ -72,6 +78,8 @@ static int injected_pthread_create(pthread_t *, const pthread_attr_t *,
 #define free injected_free
 #define recv injected_recv
 #define send injected_send
+#define recvfrom injected_recvfrom
+#define sendto injected_sendto
 #if defined(_WIN32) || defined(__APPLE__)
 #define setsockopt injected_setsockopt
 #endif
@@ -86,6 +94,8 @@ static int injected_pthread_create(pthread_t *, const pthread_attr_t *,
 #define select injected_select
 #define WSACreateEvent injected_wsa_create_event
 #define WSAEventSelect injected_wsa_event_select
+#define WaitForSingleObject injected_wait_single
+#define WaitForMultipleObjects injected_wait_multiple
 #else
 #define close injected_close
 #define ioctl injected_ioctl
@@ -107,6 +117,8 @@ static int injected_pthread_create(pthread_t *, const pthread_attr_t *,
 #undef free
 #undef recv
 #undef send
+#undef recvfrom
+#undef sendto
 #if defined(_WIN32) || defined(__APPLE__)
 #undef setsockopt
 #endif
@@ -120,6 +132,8 @@ static int injected_pthread_create(pthread_t *, const pthread_attr_t *,
 #undef select
 #undef WSACreateEvent
 #undef WSAEventSelect
+#undef WaitForSingleObject
+#undef WaitForMultipleObjects
 #else
 #undef close
 #undef ioctl
@@ -188,6 +202,8 @@ static socket_t expired_connect_socket = INVALID_FD;
 static socket_t deadline_io_socket = INVALID_FD;
 static unsigned int deadline_io_recv_bytes, deadline_io_send_bytes;
 static unsigned int deadline_io_advance, deadline_io_triggers, deadline_io_connects;
+/* Advance only the caller after a real DNS completion notification. */
+static unsigned int resolver_wait_advance, resolver_wait_triggers;
 #if defined(_WIN32) || defined(__APPLE__)
 static atomic_int udp_binding_failure = ATOMIC_VAR_INIT(0);
 static socket_t failed_udp_binding_socket = INVALID_FD;
@@ -514,6 +530,31 @@ static ssize_t injected_send(int fd, const void *buffer, size_t length, int flag
     return n;
 }
 
+#ifdef _WIN32
+static int injected_recvfrom(SOCKET fd, char *buffer, int length, int flags,
+                              struct sockaddr *address, int *address_length) {
+#else
+static ssize_t injected_recvfrom(int fd, void *buffer, size_t length, int flags,
+                                  struct sockaddr *address, socklen_t *address_length) {
+#endif
+    int count = (int)recvfrom(fd, buffer, length, flags, address, address_length);
+    /* Empty datagrams are successful I/O as well. */
+    advance_after_io(fd, count >= 0 ? 1 : -1, 0);
+    return count;
+}
+
+#ifdef _WIN32
+static int injected_sendto(SOCKET fd, const char *buffer, int length, int flags,
+                            const struct sockaddr *address, int address_length) {
+#else
+static ssize_t injected_sendto(int fd, const void *buffer, size_t length, int flags,
+                                const struct sockaddr *address, socklen_t address_length) {
+#endif
+    int count = (int)sendto(fd, buffer, length, flags, address, address_length);
+    advance_after_io(fd, count >= 0 ? 1 : -1, 1);
+    return count;
+}
+
 #if defined(_WIN32) || defined(__APPLE__)
 #ifdef _WIN32
 static int injected_setsockopt(SOCKET fd, int level, int option, const char *value, int length) {
@@ -750,6 +791,27 @@ static void expire_poll_result(pollfd_t *fds, size_t count, int ready) {
     }
 }
 
+static void advance_after_resolver_wait(void) {
+    if (!resolver_wait_advance) return;
+    atomic_store_explicit(&clock_advance_seconds, resolver_wait_advance, memory_order_relaxed);
+    resolver_wait_advance = 0;
+    ++resolver_wait_triggers;
+}
+
+#ifdef _WIN32
+static DWORD injected_wait_single(HANDLE event, DWORD timeout) {
+    DWORD ready = WaitForSingleObject(event, timeout);
+    if (ready == WAIT_OBJECT_0) advance_after_resolver_wait();
+    return ready;
+}
+
+static DWORD injected_wait_multiple(DWORD count, const HANDLE *events, BOOL all, DWORD timeout) {
+    DWORD ready = WaitForMultipleObjects(count, events, all, timeout);
+    if (ready == WAIT_OBJECT_0) advance_after_resolver_wait();
+    return ready;
+}
+#endif
+
 static int expire_connect_wait(int ready) {
     if (ready > 0 && expire_connect_ready) {
         expire_connect_ready = 0;
@@ -802,6 +864,7 @@ static int injected_poll(struct pollfd *fds, nfds_t count, int timeout) {
     synchronize_udp_input(fds, count);
     if (!fake_connect) {
         int ready = poll(fds, count, timeout);
+        if (ready > 0 && (fds[0].revents & POLLIN)) advance_after_resolver_wait();
         expire_poll_result(fds, count, ready);
         return ready;
     }
@@ -896,6 +959,7 @@ static struct udp_dns_entry *cached_entry(struct udp_dns_entry *cache, const cha
     for (unsigned int i = 0; i < UDP_DNS_CACHE_LIMIT; ++i)
         if (cache[i].expires_at_ms > monotonic_milliseconds() &&
             !strcmp(cache[i].host, host)) return &cache[i];
+    fprintf(stderr, "Expected live UDP DNS cache entry: %s\n", host);
     assert(0 && "expected a live cache entry");
     return NULL;
 }
@@ -1093,7 +1157,8 @@ struct destination_fixture {
 static void grant_udp_destination(struct destination_fixture *fixture, unsigned int index) {
     socket_t ipv6 = INVALID_FD;
     assert(send_udp_request((const unsigned char *)"ask", 3, &fixture->addresses[index],
-                            &fixture->outbound, &ipv6, fixture->destinations));
+                            &fixture->outbound, &ipv6, fixture->destinations,
+                            monotonic_milliseconds() + 1000));
     assert(ipv6 == INVALID_FD);
     assert(wait_for_io(fixture->targets[index], POLLIN, monotonic_milliseconds() + 1000));
     char received[8];
@@ -1112,7 +1177,7 @@ static int receive_udp_destination_reply(struct destination_fixture *fixture,
     assert(wait_for_io(fixture->outbound, POLLIN, monotonic_milliseconds() + 1000));
     int forwarded = forward_udp_reply(fixture->outbound, fixture->association,
                                        &fixture->receiver_address, fixture->packet,
-                                       fixture->destinations);
+                                       fixture->destinations, monotonic_milliseconds() + 1000);
     if (!forwarded) {
         assert(!wait_for_io(fixture->receiver, POLLIN, monotonic_milliseconds() + 10));
         return 0;
@@ -1171,7 +1236,8 @@ static void test_udp_destination_lifetime(void) {
     assert(oversized != NULL);
     socket_t ipv6 = INVALID_FD;
     assert(!send_udp_request(oversized, 70000, &fixture->addresses[0],
-                             &fixture->outbound, &ipv6, fixture->destinations));
+                             &fixture->outbound, &ipv6, fixture->destinations,
+                             monotonic_milliseconds() + 1000));
     assert(!receive_udp_destination_reply(fixture, 0));
     grant_udp_destination(fixture, 0);
     assert(receive_udp_destination_reply(fixture, 0));
@@ -1183,7 +1249,8 @@ static void test_udp_destination_lifetime(void) {
                            memory_order_relaxed);
     assert(receive_udp_destination_reply(fixture, 0));
     assert(!send_udp_request(oversized, 70000, &fixture->addresses[0],
-                             &fixture->outbound, &ipv6, fixture->destinations));
+                             &fixture->outbound, &ipv6, fixture->destinations,
+                             monotonic_milliseconds() + 1000));
     free(oversized);
     atomic_store_explicit(&clock_advance_seconds,
                            2 * UDP_DESTINATION_TTL_SECONDS + UDP_DESTINATION_TTL_SECONDS / 2 + 1,
@@ -1238,6 +1305,110 @@ static void control_pair(socket_t pair[2]) {
     pair[0] = accept(listener, NULL, NULL);
     assert(pair[0] != INVALID_FD && set_nonblocking(pair[0], 1));
     close_socket(listener);
+}
+
+static void test_udp_completion_deadlines(void) {
+#ifdef _WIN32
+    WSADATA winsock;
+    assert(WSAStartup(MAKEWORD(2, 2), &winsock) == 0);
+#endif
+    wait_for_resolvers();
+    struct destination_fixture *fixture = calloc(1, sizeof(*fixture));
+    assert(fixture != NULL);
+    socket_t *sockets[] = {&fixture->targets[0], &fixture->outbound,
+                           &fixture->association, &fixture->receiver};
+    struct sockaddr_storage *addresses[] = {&fixture->addresses[0], &fixture->outbound_address,
+                                             NULL, &fixture->receiver_address};
+    struct sockaddr_in local = {0};
+    local.sin_family = AF_INET;
+    local.sin_addr.s_addr = htonl(TEST_LOOPBACK_IP);
+    for (unsigned int i = 0; i < 4; ++i) {
+        *sockets[i] = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        assert(*sockets[i] != INVALID_FD);
+        assert(bind(*sockets[i], (struct sockaddr *)&local, sizeof(local)) == 0);
+        assert(set_nonblocking(*sockets[i], 1));
+        if (addresses[i]) {
+            socklen_t length = sizeof(*addresses[i]);
+            assert(getsockname(*sockets[i], (struct sockaddr *)addresses[i], &length) == 0);
+        }
+    }
+    unsigned short port = address_port(&fixture->addresses[0]);
+    int previous_fake_dns = fake_dns;
+    fake_dns = 1;
+    for (int mode = 0; mode < 3; ++mode) { /* Numeric, fresh DNS, cached DNS. */
+        for (int expired = 0; expired <= 1; ++expired) {
+            struct udp_dns_entry cache[UDP_DNS_CACHE_LIMIT] = {{0}};
+            socket_t ipv6 = INVALID_FD;
+            char received[8];
+            if (mode == 2) {
+                assert(domain_request("cached.test", port, &fixture->outbound, &ipv6,
+                                       fixture->destinations, cache));
+                assert(wait_for_io(fixture->targets[0], POLLIN, monotonic_milliseconds() + 1000));
+                assert(recvfrom(fixture->targets[0], received, sizeof(received), 0, NULL, NULL) == 0);
+            }
+            memset(fixture->destinations, 0, sizeof(fixture->destinations));
+            deadline_io_socket = fixture->outbound;
+            deadline_io_send_bytes = 1; /* Also advance after an empty datagram. */
+            deadline_io_recv_bytes = deadline_io_triggers = 0;
+            deadline_io_advance = expired ? IDLE_TIMEOUT_SECONDS + 1 : 0;
+            unsigned int before = resolutions;
+            int result = domain_request(mode ? "cached.test" : "127.0.0.1", port,
+                                         &fixture->outbound, &ipv6, fixture->destinations, cache);
+            deadline_io_socket = INVALID_FD;
+            assert(deadline_io_triggers == 1 && result == !expired);
+            assert(resolutions == before + (mode == 1));
+            for (unsigned int i = 0; i < UDP_DESTINATION_LIMIT; ++i)
+                assert((fixture->destinations[i].expires_at_ms != 0) == (!expired && i == 0));
+            if (mode == 1 && expired)
+                for (unsigned int i = 0; i < UDP_DNS_CACHE_LIMIT; ++i)
+                    assert(cache[i].expires_at_ms == 0);
+            atomic_store_explicit(&clock_advance_seconds, 0, memory_order_relaxed);
+            /* The syscall already sent these bytes; timeout cannot retract them. */
+            assert(wait_for_io(fixture->targets[0], POLLIN, monotonic_milliseconds() + 1000));
+            assert(recvfrom(fixture->targets[0], received, sizeof(received), 0, NULL, NULL) == 0);
+            assert(ipv6 == INVALID_FD);
+        }
+    }
+    for (int sending = 0; sending <= 1; ++sending) {
+        for (int expired = 0; expired <= 1; ++expired) {
+            grant_udp_destination(fixture, 0);
+            uint64_t expiry = fixture->destinations[0].expires_at_ms;
+            assert(sendto(fixture->targets[0], "", 0, 0,
+                           (struct sockaddr *)&fixture->outbound_address,
+                           address_length(&fixture->outbound_address)) == 0);
+            assert(wait_for_io(fixture->outbound, POLLIN, monotonic_milliseconds() + 1000));
+            deadline_io_socket = sending ? fixture->association : fixture->outbound;
+            deadline_io_send_bytes = sending ? 1 : 0;
+            deadline_io_recv_bytes = sending ? 0 : 1;
+            deadline_io_triggers = 0;
+            deadline_io_advance = expired ? IDLE_TIMEOUT_SECONDS + 1 : 0;
+            int result = forward_udp_reply(fixture->outbound, fixture->association,
+                                             &fixture->receiver_address, fixture->packet,
+                                             fixture->destinations, monotonic_milliseconds() + 1000);
+            deadline_io_socket = INVALID_FD;
+            assert(deadline_io_triggers == 1 && (result != 0) == !expired);
+            assert(fixture->destinations[0].expires_at_ms == expiry);
+            atomic_store_explicit(&clock_advance_seconds, 0, memory_order_relaxed);
+            int delivered = !expired || sending;
+            assert(wait_for_io(fixture->receiver, POLLIN, monotonic_milliseconds() + 10) == delivered);
+            if (delivered) {
+                unsigned char reply[16];
+                assert(recvfrom(fixture->receiver, (char *)reply, sizeof(reply), 0, NULL, NULL) == 10);
+                assert(!memcmp(reply, "\0\0\0\1", 4));
+                const struct sockaddr_in *target = (const struct sockaddr_in *)&fixture->addresses[0];
+                assert(!memcmp(reply + 4, &target->sin_addr, 4));
+                assert(!memcmp(reply + 8, &target->sin_port, 2));
+            }
+        }
+    }
+    wait_for_resolvers();
+    fake_dns = previous_fake_dns;
+    for (unsigned int i = 0; i < 4; ++i) close_socket(*sockets[i]);
+    free(fixture);
+#ifdef _WIN32
+    WSACleanup();
+#endif
+    puts("UDP completion checks passed (numeric/DNS/cache sends, reply recv/send, empty datagrams, no late grants/cache).");
 }
 
 static void test_io_completion_deadlines(void) {
@@ -1585,6 +1756,83 @@ static void test_expired_ready_events(void) {
 #endif
     observe_real_clock = 0;
     puts("Expired readiness checks passed (TCP both directions, UDP replies, no idle revival, real-time observer).");
+}
+
+static void test_relay_completion_deadlines(void) {
+    observe_real_clock = 1;
+#ifdef _WIN32
+    WSADATA winsock;
+    assert(WSAStartup(MAKEWORD(2, 2), &winsock) == 0);
+#endif
+    for (int upstream = 0; upstream <= 1; ++upstream) {
+        for (int sending = 0; sending <= 1; ++sending) {
+            for (int expired = 0; expired <= 1; ++expired) {
+                socket_t client[2], target[2];
+                control_pair(client);
+                control_pair(target);
+                socket_t peers[2] = {client[0], target[0]};
+                socket_t source = upstream ? client[1] : target[1];
+                socket_t receiver = upstream ? target[1] : client[1];
+                const unsigned char payload[] = "idle completion";
+                deadline_io_socket = sending ? (upstream ? target[0] : client[0]) :
+                                               (upstream ? client[0] : target[0]);
+                deadline_io_recv_bytes = sending ? 0 : sizeof(payload);
+                deadline_io_send_bytes = sending ? sizeof(payload) : 0;
+                deadline_io_triggers = 0;
+                deadline_io_advance = expired ? IDLE_TIMEOUT_SECONDS + 1 : 0;
+                assert(send(source, (const char *)payload, sizeof(payload), 0) == sizeof(payload));
+#ifdef _WIN32
+                HANDLE thread = CreateThread(NULL, 0, relay_fixture_thread, peers, 0, NULL);
+                assert(thread != NULL);
+#else
+                pthread_t thread;
+                assert(pthread_create(&thread, NULL, relay_fixture_thread, peers) == 0);
+#endif
+                unsigned char received[sizeof(payload)];
+                uint64_t deadline_ms = monotonic_milliseconds() + 400;
+                if (!expired || sending) {
+                    assert(recv_all(receiver, received, sizeof(received), deadline_ms));
+                    assert(!memcmp(received, payload, sizeof(payload)));
+                }
+                if (expired) {
+                    /* Keep both peers open: only expiry may end this relay. */
+                    assert(wait_for_io(receiver, POLLIN, deadline_ms));
+                    assert(recv(receiver, (char *)received, sizeof(received), 0) == 0);
+                } else {
+                    assert(shutdown(source,
+#ifdef _WIN32
+                                    SD_SEND
+#else
+                                    SHUT_WR
+#endif
+                                   ) == 0);
+                    assert(shutdown(receiver,
+#ifdef _WIN32
+                                    SD_SEND
+#else
+                                    SHUT_WR
+#endif
+                                   ) == 0);
+                }
+#ifdef _WIN32
+                assert(WaitForSingleObject(thread, 400) == WAIT_OBJECT_0);
+                CloseHandle(thread);
+#else
+                assert(pthread_join(thread, NULL) == 0);
+#endif
+                assert(deadline_io_triggers == 1);
+                deadline_io_socket = INVALID_FD;
+                atomic_store_explicit(&clock_advance_seconds, 0, memory_order_relaxed);
+                close_socket(client[1]);
+                close_socket(target[1]);
+            }
+        }
+    }
+#ifdef _WIN32
+    WSACleanup();
+#endif
+    observe_real_clock = 0;
+    puts("TCP completion checks passed (both directions, late recv/send, no idle revival, valid payloads and FIN).");
 }
 
 static void test_udp_control_backlog(void) {
@@ -2255,6 +2503,67 @@ static void test_resolver_abandoned_entry(void) {
     puts("Resolver abandonment checks passed (unexpired budget, TCP reset, UDP close, caller socket reuse, TCP FIN/data preserved, notification/job cleanup, recovery).");
 }
 
+static void test_resolver_wait_deadline(void) {
+#ifdef _WIN32
+    WSADATA winsock;
+    assert(WSAStartup(MAKEWORD(2, 2), &winsock) == 0);
+#endif
+    wait_for_resolvers();
+    for (int mode = RESOLVE_TCP; mode <= RESOLVE_UDP; ++mode) {
+        for (int expired = 0; expired <= 1; ++expired) {
+            socket_t control[2];
+            control_pair(control);
+            struct addrinfo hints = {0}, *addresses = NULL;
+            hints.ai_family = AF_INET;
+            hints.ai_socktype = mode == RESOLVE_TCP ? SOCK_STREAM : SOCK_DGRAM;
+            hints.ai_flags = AI_NUMERICSERV;
+            resolver_wait_advance = expired ? 2 : 1;
+            resolver_wait_triggers = 0;
+            int result = resolve_target("127.0.0.1", "80", &hints, &addresses,
+                                         monotonic_milliseconds() + (expired ? 1000 : 3000),
+                                         control[0], (enum resolver_control_mode)mode);
+            assert(resolver_wait_triggers == 1);
+            assert(result == (expired ? EAI_AGAIN : 0));
+            assert((addresses != NULL) == !expired);
+            if (addresses) freeaddrinfo(addresses);
+            wait_for_resolvers();
+            atomic_store_explicit(&clock_advance_seconds, 0, memory_order_relaxed);
+            close_socket(control[0]);
+            close_socket(control[1]);
+        }
+    }
+    /* DNS has a shorter budget than this still-live UDP association. */
+    struct udp_destination destinations[UDP_DESTINATION_LIMIT] = {{0}};
+    struct udp_dns_entry cache[UDP_DNS_CACHE_LIMIT] = {{0}};
+    socket_t ipv4 = INVALID_FD, ipv6 = INVALID_FD;
+    unsigned char packet[] = {0, 0, 0, 3, 4, 'l', 'a', 't', 'e', 0, 80};
+    fake_dns = 1;
+    resolver_wait_advance = CONNECT_TIMEOUT_SECONDS + 1;
+    resolver_wait_triggers = 0;
+    assert(!forward_udp_request(packet, sizeof(packet), &ipv4, &ipv6, destinations, cache,
+                                 monotonic_milliseconds() + 5000, INVALID_FD));
+    assert(resolver_wait_triggers == 1);
+    assert(ipv4 == INVALID_FD && ipv6 == INVALID_FD);
+    for (unsigned int i = 0; i < UDP_DESTINATION_LIMIT; ++i)
+        assert(destinations[i].expires_at_ms == 0);
+    for (unsigned int i = 0; i < UDP_DNS_CACHE_LIMIT; ++i)
+        assert(cache[i].expires_at_ms == 0);
+    wait_for_resolvers();
+    fake_dns = 0;
+    atomic_store_explicit(&clock_advance_seconds, 0, memory_order_relaxed);
+    struct addrinfo hints = {0}, *addresses = NULL;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    assert(resolve_target("127.0.0.1", "80", &hints, &addresses,
+                          monotonic_milliseconds() + 1000, INVALID_FD, RESOLVE_TCP) == 0);
+    freeaddrinfo(addresses);
+    wait_for_resolvers();
+#ifdef _WIN32
+    WSACleanup();
+#endif
+    puts("Resolver wait checks passed (late TCP/UDP notification, no UDP send/grant/cache, slots reclaimed, recovery).");
+}
+
 static void test_resolver_deadline_and_limit(void) {
 #ifdef _WIN32
     WSADATA winsock;
@@ -2489,12 +2798,14 @@ int main(int argc, char **argv) {
         test_dns_cache();
         puts("UDP DNS checks passed (100 literals, zero resolutions; 100 case variants, one resolution; syntax, TTL, ports, failures).");
         test_udp_destination_lifetime();
+        test_udp_completion_deadlines();
 #if defined(_WIN32) || defined(__APPLE__)
         test_udp_binding_failures();
 #endif
         test_udp_control_fairness();
         test_udp_control_backlog();
         test_expired_ready_events();
+        test_relay_completion_deadlines();
         test_connection_fallback();
         test_resolver_setup_cancellation();
 #ifndef _WIN32
@@ -2502,6 +2813,7 @@ int main(int argc, char **argv) {
 #endif
         test_resolver_delayed_entry();
         test_resolver_abandoned_entry();
+        test_resolver_wait_deadline();
         test_resolver_deadline_and_limit();
         test_resolver_control_close();
         test_resolver_tcp_reset();
